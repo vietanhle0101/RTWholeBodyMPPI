@@ -5,7 +5,7 @@ import numpy as np
 
 # Local imports (ensure these are part of your package structure)
 from whole_body_mppi.utils.tasks import get_task
-from whole_body_mppi.control.controllers.base_controller import BaseMPPI
+from whole_body_mppi.control.controllers.base_dpc import BaseDPC
 from whole_body_mppi.control.gait_scheduler.scheduler import GaitScheduler
 from whole_body_mppi.control.gait_scheduler.scheduler import Timer
 from whole_body_mppi.utils.transforms import batch_world_to_local_velocity, calculate_orientation_quaternion
@@ -20,19 +20,16 @@ GAIT_TROT_PATH = os.path.join(GAIT_DIR, "MED/walking_gait_raibert_MED_0_5_15cm_1
 GAIT_WALK_PATH = os.path.join(GAIT_DIR, "MED/walking_gait_raibert_MED_0_1_10cm_100hz.tsv")
 GAIT_WALK_FAST_PATH = os.path.join(GAIT_DIR, "FAST/walking_gait_raibert_FAST_0_1_10cm_100hz.tsv")
 
-class MPPI(BaseMPPI):
+class DPC(BaseDPC):
     """
-    Model Predictive Path Integral (MPPI) Controller for quadruped robots.
+    Differentiable Predictive Control for quadruped robots.
 
     Attributes:
-        - Task-specific parameters and goals.
-        - Gait scheduler and configurations.
-        - MPPI sampling and cost calculation configurations.
     """
 
     def __init__(self, task='stand') -> None:
         """
-        Initialize the MPPI controller with task-specific configurations.
+        Initialize the DPC controller with task-specific configurations.
 
         Args:
             task (str): The name of the task ('stand', 'walk').
@@ -69,7 +66,6 @@ class MPPI(BaseMPPI):
         # Set initial parameters and state
         self.obs = None
         self.internal_ref = True
-        self.exp_weights = np.ones(self.n_samples) / self.n_samples  # Initial MPPI weights
         self.waiting_times = waiting_times
         self.timer = Timer(end_time=self.waiting_times[0])
 
@@ -83,7 +79,7 @@ class MPPI(BaseMPPI):
         self.gait_scheduler = self.gaits['in_place']
 
         # Initialize planner and goals
-        self.reset_planner()
+        # self.reset_planner()
         self.goal_index = 0
         self.body_ref = np.concatenate((self.goal_pos[self.goal_index],
                                         self.goal_ori[self.goal_index],
@@ -129,81 +125,6 @@ class MPPI(BaseMPPI):
                 self.noise_sigma = np.array([0.06, 0.1, 0.1] * 4)
             elif self.desired_gait[self.goal_index] in ['trot']:
                 self.noise_sigma = np.array([0.06, 0.2, 0.2] * 4)
-        
-    def update(self, obs):
-        """
-        Update the MPPI controller based on the current observation.
-
-        Args:
-            obs (np.ndarray): Current state observation.
-        Returns:
-            np.ndarray: Selected action based on the optimal trajectory.
-        """
-         # Generate perturbed actions for rollouts
-        actions = self.perturb_action()
-        self.obs = obs
-
-        # Calculate the direction and distance to the goal
-        direction = self.body_ref[:3] - obs[:3]
-        goal_delta = np.linalg.norm(direction)
-
-        # Update desired orientation based on the goal position
-        if goal_delta > 0.1 and not self.timer.waiting:
-            self.goal_ori = calculate_orientation_quaternion(obs[:3], self.body_ref[:3])
-        else:
-            self.goal_ori = np.array([1, 0, 0, 0])
-
-        self.body_ref[3:7] = self.goal_ori
-
-        # Perform rollouts using threaded rollout function
-        self.rollout_func(self.state_rollouts, actions, np.repeat(
-            np.array([np.concatenate([[0], obs])]), self.n_samples, axis=0), 
-            num_workers=self.num_workers, nstep=self.horizon)
-
-        # Update joint references from the gait scheduler
-        if self.internal_ref:
-            self.joints_ref = self.gait_scheduler.gait[:, self.gait_scheduler.indices[:self.horizon]]
-
-        # Calculate costs for each sampled trajectory
-        costs_sum = self.cost_func(self.state_rollouts[:, :, 1:], actions, self.joints_ref, self.body_ref)
-
-        # Update the gait scheduler
-        self.gait_scheduler.roll()
-
-        # Calculate MPPI weights for the samples
-        min_cost = np.min(costs_sum)
-        max_cost = np.max(costs_sum)
-        self.exp_weights = np.exp(-1 / self.temperature * ((costs_sum - min_cost) / (max_cost - min_cost)))
-
-        # Weighted average of action deltas
-        weighted_delta_u = self.exp_weights.reshape(self.n_samples, 1, 1) * actions
-        weighted_delta_u = np.sum(weighted_delta_u, axis=0) / (np.sum(self.exp_weights) + 1e-10)
-        updated_actions = np.clip(weighted_delta_u, self.act_min, self.act_max)
-
-        # Update the trajectory with the optimal action
-        self.selected_trajectory = updated_actions
-        self.trajectory = np.roll(updated_actions, shift=-1, axis=0)
-        self.trajectory[-1] = updated_actions[-1]
-
-        # Return the first action in the trajectory as the output action
-        return updated_actions[0]
-    
-    def quaternion_distance_np(self, q1, q2):
-        """
-        Compute the distance between two sets of quaternions.
-
-        Args:
-            q1 (np.ndarray): Array of quaternions (N x 4).
-            q2 (np.ndarray): Array of quaternions (N x 4).
-
-        Returns:
-            np.ndarray: Array of distances between the quaternions.
-        """
-        # Compute dot product between corresponding quaternions
-        dot_products = np.einsum('ij,ij->i', q1, q2)
-        # Compute distance as 1 - absolute dot product
-        return 1 - np.abs(dot_products)
-
 
     def quadruped_cost_np(self, x, u, x_ref):
         """
@@ -248,31 +169,24 @@ class MPPI(BaseMPPI):
         )
         return cost
 
-
     def calculate_total_cost(self, states, actions, joints_ref, body_ref):
         """
         Calculate the total cost for all rollouts.
 
         Args:
-            states (np.ndarray): Rollout states (samples x time steps x state_dim).
-            actions (np.ndarray): Rollout actions (samples x time steps x action_dim).
+            states (np.ndarray): Rollout states (batch x time steps x state_dim).
+            actions (np.ndarray): Rollout actions (batch x time steps x action_dim).
             joints_ref (np.ndarray): Reference joint positions (time steps x joint_dim).
             body_ref (np.ndarray): Reference body state (state_dim).
 
         Returns:
             np.ndarray: Total cost for each sample.
         """
-        print(states.shape)
-        print(actions.shape)
-        print(joints_ref.shape)
-        print(body_ref.shape)
-        print("-"*30)
-
-        num_samples = states.shape[0]
+        batch_size = states.shape[0]
         num_pairs = states.shape[1]
 
         # Repeat body reference for all samples and time steps
-        traj_body_ref = np.repeat(body_ref[np.newaxis, :], num_samples * num_pairs, axis=0)
+        traj_body_ref = np.repeat(body_ref[np.newaxis, :], batch_size * num_pairs, axis=0)
 
         # Flatten states and actions for batch processing
         states = states.reshape(-1, states.shape[2])
@@ -280,7 +194,7 @@ class MPPI(BaseMPPI):
 
         # Repeat and reshape joint references for batch processing
         joints_ref = joints_ref.T
-        joints_ref = np.tile(joints_ref, (num_samples, 1, 1))
+        joints_ref = np.tile(joints_ref, (batch_size, 1, 1))
         joints_ref = joints_ref.reshape(-1, joints_ref.shape[2])
 
         # Concatenate body and joint references for full reference state
@@ -297,29 +211,73 @@ class MPPI(BaseMPPI):
         costs = self.quadruped_cost_np(states, actions, x_ref)
 
         # Sum costs across time steps for each sample
-        total_costs = costs.reshape(num_samples, num_pairs).sum(axis=1)
+        total_costs = costs.reshape(batch_size, num_pairs).sum(axis=1)
         return total_costs
 
-    def eval_best_trajectory(self):
+    def quaternion_distance_np(self, q1, q2):
         """
-        Evaluate the cost of the best trajectory selected by MPPI.
+        Compute the distance between two sets of quaternions.
+
+        Args:
+            q1 (np.ndarray): Array of quaternions (N x 4).
+            q2 (np.ndarray): Array of quaternions (N x 4).
 
         Returns:
-            float: Cost of the best trajectory, or None if no observation is available.
+            np.ndarray: Array of distances between the quaternions.
         """
-        if self.obs is None:
-            # If no observation is available, return None
-            return None
-        else:
-            # Create a rollout array for the best trajectory
-            best_rollouts = np.zeros((1, self.horizon, mujoco.mj_stateSize(self.model, mujoco.mjtState.mjSTATE_FULLPHYSICS.value)))
-            # Perform rollout for the best trajectory
-            self.rollout_func(best_rollouts, np.array([self.selected_trajectory]), np.repeat(np.array([np.concatenate([[0],self.obs])]), 1, axis=0), num_workers=self.num_workers, nstep=self.horizon)
-        # Compute and return the cost of the best trajectory
-        return (self.cost_func(best_rollouts[:,:,1:], np.array([self.selected_trajectory]), self.joints_ref, self.body_ref))[0]
+        # Compute dot product between corresponding quaternions
+        dot_products = np.einsum('ij,ij->i', q1, q2)
+        # Compute distance as 1 - absolute dot product
+        return 1 - np.abs(dot_products)
 
-    def __del__(self):
-        self.shutdown()
+    def update(self, obs):
+        """
+        Update the MPPI controller based on the current observation.
+
+        Args:
+            obs (np.ndarray): Current state observation.
+        Returns:
+            np.ndarray: Selected action based on the optimal trajectory.
+        """
+         # Generate perturbed actions for rollouts
+        self.obs = obs
+
+        # Calculate the direction and distance to the goal
+        direction = self.body_ref[:3] - obs[:3]
+        goal_delta = np.linalg.norm(direction)
+
+        # Update desired orientation based on the goal position
+        if goal_delta > 0.1 and not self.timer.waiting:
+            self.goal_ori = calculate_orientation_quaternion(obs[:3], self.body_ref[:3])
+        else:
+            self.goal_ori = np.array([1, 0, 0, 0])
+
+        self.body_ref[3:7] = self.goal_ori
+
+        # Actions are generated from a neural control policy
+        actions = None
+
+        # Perform rollouts using threaded rollout function
+        self.rollout_func(self.state_rollouts, actions, np.repeat(
+            np.array([np.concatenate([[0], obs])]), self.n_samples, axis=0), 
+            num_workers=self.num_workers, nstep=self.horizon)
+
+        # Update joint references from the gait scheduler
+        if self.internal_ref:
+            self.joints_ref = self.gait_scheduler.gait[:, self.gait_scheduler.indices[:self.horizon]]
+
+        # Update the gait scheduler
+        self.gait_scheduler.roll()
+
+        updated_actions = np.clip(actions, self.act_min, self.act_max)
+
+        # Update the trajectory with the optimal action
+        self.selected_trajectory = updated_actions
+        self.trajectory = np.roll(updated_actions, shift=-1, axis=0)
+        self.trajectory[-1] = updated_actions[-1]
+
+        # Return the first action in the trajectory as the output action
+        return updated_actions[0]
     
-if __name__ == "__main__":
-    mppi = MPPI()
+    def set_policy(self, policy):
+        self.policy = policy
