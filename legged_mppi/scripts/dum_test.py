@@ -1,14 +1,11 @@
-import argparse
 import numpy as np
 import os
-import jax
-import jax.numpy as jnp
-
-from whole_body_mppi.policy.policy import NeuralControlPolicy, PolicyBounds
+from whole_body_mppi.utils.tasks import get_task
 from whole_body_mppi.interface.simulator import Simulator
 from whole_body_mppi.control.controllers.mppi_locomotion import MPPI
-from whole_body_mppi.utils.tasks import get_task
-from whole_body_mppi.control.controllers.dpc_locomotion import DPC
+from whole_body_mppi.control.controllers.srbm_mppi import SRBM_MPPI
+
+import argparse
 
 def main(task):
     T = 2000  # 20 seconds
@@ -29,32 +26,16 @@ def main(task):
     task_data = get_task(task)
     sim_path = os.path.join(os.path.dirname(__file__), "../whole_body_mppi", task_data["sim_path"])
 
-    # Initialize the neural control policy
-    # 1) Build policy
-    in_dim = 50  # e.g., your observation dimension
-    bounds = PolicyBounds.quadruped_default()
-    policy = NeuralControlPolicy(
-        in_dim=in_dim,
-        act_dim=12,
-        hidden_dim=256,
-        num_hidden_layers=3,
-        bounds=bounds,
-        activation="gelu",
-        dropout=0.0,
-    )
-
-    # Initialize DPC agent
-    agent = DPC(task=task)
-    agent.set_policy(policy)
-
-
-    # Initialize simulator
-    # simulator = Simulator(agent=agent, viewer=VIEWER, T=T, dt=SIMULATION_STEP, timeconst=TIMECONST,
-                        #   dampingratio=DAMPINGRATIO, model_path=sim_path, ctrl_rate=CTRL_UPDATE_RATE)
+    # Initialize agent and simulator
+    agent = SRBM_MPPI(task=task)
+    
+    # agent.set_params(horizon=CTRL_HORIZON, lambda_=CTRL_LAMBDA, N=CTRL_N_SAMPLES)
+    simulator = Simulator(agent=agent, viewer=VIEWER, T=T, dt=SIMULATION_STEP, timeconst=TIMECONST,
+                          dampingratio=DAMPINGRATIO, model_path=sim_path, ctrl_rate=CTRL_UPDATE_RATE)
     
     # Run simulation
-    # simulator.run()
-    # simulator.plot_trajectory()
+    simulator.run()
+    simulator.plot_trajectory()
 
 if __name__ == "__main__":
     # Define valid tasks

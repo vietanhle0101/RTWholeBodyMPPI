@@ -262,12 +262,6 @@ class MPPI(BaseMPPI):
         Returns:
             np.ndarray: Total cost for each sample.
         """
-        print(states.shape)
-        print(actions.shape)
-        print(joints_ref.shape)
-        print(body_ref.shape)
-        print("-"*30)
-
         num_samples = states.shape[0]
         num_pairs = states.shape[1]
 

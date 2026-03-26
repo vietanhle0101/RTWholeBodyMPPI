@@ -2,6 +2,7 @@ import os
 import yaml
 import mujoco
 import numpy as np
+import jax.numpy as jnp
 
 # Local imports (ensure these are part of your package structure)
 from whole_body_mppi.utils.tasks import get_task
@@ -19,6 +20,38 @@ GAIT_INPLACE_PATH = os.path.join(GAIT_DIR, "FAST/walking_gait_raibert_FAST_0_0_1
 GAIT_TROT_PATH = os.path.join(GAIT_DIR, "MED/walking_gait_raibert_MED_0_5_15cm_100hz.tsv")
 GAIT_WALK_PATH = os.path.join(GAIT_DIR, "MED/walking_gait_raibert_MED_0_1_10cm_100hz.tsv")
 GAIT_WALK_FAST_PATH = os.path.join(GAIT_DIR, "FAST/walking_gait_raibert_FAST_0_1_10cm_100hz.tsv")
+
+def quaternion_distance_jax(q1, q2):
+    dot_products = jnp.einsum("ij,ij->i", q1, q2)
+    return 1.0 - jnp.abs(dot_products)
+
+def quat_conjugate(q):
+    return q * jnp.array([1.0, -1.0, -1.0, -1.0], dtype=q.dtype)
+
+def quat_multiply(q1, q2):
+    w1, x1, y1, z1 = q1[:, 0], q1[:, 1], q1[:, 2], q1[:, 3]
+    w2, x2, y2, z2 = q2[:, 0], q2[:, 1], q2[:, 2], q2[:, 3]
+
+    return jnp.stack(
+        [
+            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        ],
+        axis=1,
+    )
+
+def batch_world_to_local_velocity_jax(quaternions, world_velocities):
+    # Assumes quaternions are [w, x, y, z]
+    quaternions = quaternions / jnp.linalg.norm(quaternions, axis=1, keepdims=True)
+    q_inv = quat_conjugate(quaternions)
+    v_quat = jnp.concatenate(
+        [jnp.zeros((world_velocities.shape[0], 1), dtype=world_velocities.dtype), world_velocities],
+        axis=1,
+    )
+    local_v_quat = quat_multiply(quat_multiply(q_inv, v_quat), quaternions)
+    return local_v_quat[:, 1:]
 
 class DPC(BaseDPC):
     """
@@ -62,6 +95,8 @@ class DPC(BaseDPC):
         # Cost weights
         self.Q = np.diag(np.array(params['Q_diag']))
         self.R = np.diag(np.array(params['R_diag']))
+        self.Q_jax = jnp.asarray(self.Q)
+        self.R_jax = jnp.asarray(self.R)
 
         # Set initial parameters and state
         self.obs = None
@@ -131,88 +166,74 @@ class DPC(BaseDPC):
         Compute the cost for quadruped motion based on state and action errors.
 
         Args:
-            x (np.ndarray): Current states (N x state_dim).
-            u (np.ndarray): Current actions (N x action_dim).
-            x_ref (np.ndarray): Reference states (N x state_dim).
+            x (jnp.ndarray): Current states (N x state_dim).
+            u (jnp.ndarray): Current actions (N x action_dim).
+            x_ref (jnp.ndarray): Reference states (N x state_dim).
 
         Returns:
-            np.ndarray: Computed cost for each sample.
+            jnp.ndarray: Computed cost for each sample.
         """
-        kp = 50  # Proportional gain for joint error
-        kd = 3   # Derivative gain for joint velocity error
+        kp = 50.0
+        kd = 3.0
 
-        # Compute state error relative to the reference
         x_error = x - x_ref
 
-        # Compute quaternion distance for orientation error
-        q_dist = self.quaternion_distance_np(x[:, 3:7], x_ref[:, 3:7])
-        x_error[:, 3] = q_dist
-        x_error[:, 4] = q_dist
-        x_error[:, 5] = q_dist
-        x_error[:, 6] = q_dist
+        q_dist = quaternion_distance_jax(x[:, 3:7], x_ref[:, 3:7])
+        x_error = x_error.at[:, 3:7].set(q_dist[:, None])
 
-        # Compute joint and velocity errors
         x_joint = x[:, 7:19]
         v_joint = x[:, 25:]
         u_error = kp * (u - x_joint) - kd * v_joint
 
-        # Compute positional cost (L1 norm for positional error)
-        x_error[:, :3] = 0  # Ignore positional error for simplicity
+        x_error = x_error.at[:, :3].set(0.0)
         x_pos_error = x[:, :3] - x_ref[:, :3]
-        L1_norm_pos_cost = np.abs(np.dot(x_pos_error, self.Q[:3, :3])).sum(axis=1)
+        l1_norm_pos_cost = jnp.abs(x_pos_error @ self.Q_jax[:3, :3]).sum(axis=1)
 
-        # Compute total cost
-        cost = (
-            np.einsum('ij,ik,jk->i', x_error, x_error, self.Q) +
-            np.einsum('ij,ik,jk->i', u_error, u_error, self.R) +
-            L1_norm_pos_cost
-        )
-        return cost
+        state_cost = jnp.einsum("bi,ij,bj->b", x_error, self.Q_jax, x_error)
+        control_cost = jnp.einsum("bi,ij,bj->b", u_error, self.R_jax, u_error)
+
+        return state_cost + control_cost + l1_norm_pos_cost
 
     def calculate_total_cost(self, states, actions, joints_ref, body_ref):
         """
         Calculate the total cost for all rollouts.
 
         Args:
-            states (np.ndarray): Rollout states (batch x time steps x state_dim).
-            actions (np.ndarray): Rollout actions (batch x time steps x action_dim).
-            joints_ref (np.ndarray): Reference joint positions (time steps x joint_dim).
-            body_ref (np.ndarray): Reference body state (state_dim).
+            states (jnp.ndarray): Rollout states (batch x time steps x state_dim).
+            actions (jnp.ndarray): Rollout actions (batch x time steps x action_dim).
+            joints_ref (jnp.ndarray): Reference joint positions (time steps x joint_dim).
+            body_ref (jnp.ndarray): Reference body state (state_dim).
 
         Returns:
-            np.ndarray: Total cost for each sample.
+            jnp.ndarray: Total cost for each sample.
         """
         batch_size = states.shape[0]
         num_pairs = states.shape[1]
 
-        # Repeat body reference for all samples and time steps
-        traj_body_ref = np.repeat(body_ref[np.newaxis, :], batch_size * num_pairs, axis=0)
+        traj_body_ref = jnp.repeat(body_ref[None, :], batch_size * num_pairs, axis=0)
 
-        # Flatten states and actions for batch processing
         states = states.reshape(-1, states.shape[2])
         actions = actions.reshape(-1, actions.shape[2])
 
-        # Repeat and reshape joint references for batch processing
         joints_ref = joints_ref.T
-        joints_ref = np.tile(joints_ref, (batch_size, 1, 1))
+        joints_ref = jnp.tile(joints_ref, (batch_size, 1, 1))
         joints_ref = joints_ref.reshape(-1, joints_ref.shape[2])
 
-        # Concatenate body and joint references for full reference state
-        x_ref = np.concatenate(
-            [traj_body_ref[:, :7], joints_ref[:, :12], traj_body_ref[:, 7:], joints_ref[:, 12:]],
-            axis=1
+        x_ref = jnp.concatenate(
+            [
+                traj_body_ref[:, :7],
+                joints_ref[:, :12],
+                traj_body_ref[:, 7:],
+                joints_ref[:, 12:],
+            ],
+            axis=1,
         )
 
-        # Rotate velocity vectors to the local frame
-        rotated_ref = batch_world_to_local_velocity(states[:, 3:7], states[:, 19:22])
-        states[:, 19:22] = rotated_ref
+        rotated_ref = batch_world_to_local_velocity_jax(states[:, 3:7], states[:, 19:22])
+        states = states.at[:, 19:22].set(rotated_ref)
 
-        # Compute cost for each rollout
-        costs = self.quadruped_cost_np(states, actions, x_ref)
-
-        # Sum costs across time steps for each sample
-        total_costs = costs.reshape(batch_size, num_pairs).sum(axis=1)
-        return total_costs
+        costs = self.quadruped_cost_jax(states, actions, x_ref)
+        return costs.reshape(batch_size, num_pairs).sum(axis=1)
 
     def quaternion_distance_np(self, q1, q2):
         """
