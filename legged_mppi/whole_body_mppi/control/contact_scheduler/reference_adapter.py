@@ -50,16 +50,19 @@ def face_geometry(half_length: float, half_width: float) -> Mapping[str, tuple]:
 def pushing_reference(schedule: ContactSchedule, config: Mapping[str, float], last_yaw: float = 0.0) -> Go1PushReference:
     """Return the first future MPPI reference from a contact schedule.
 
-    A free stage has no contact pose.  In that case the planned robot position is
-    used and its yaw is inferred from its planned velocity, or held at `last_yaw`
-    when that velocity is too small to give a meaningful direction (e.g. the
-    free-mode approach heuristic has just reached its intermediate waypoint).
-    Defaulting to a fixed 0.0 there instead of holding the last commanded yaw
-    caused a real bug: whenever the planned velocity dipped near zero right
-    after commanding a real (possibly very different) heading the step before,
-    the reference would snap back to "face world +x", commanding a near-180
-    degree spin for one replan cycle before flipping back -- visible in
-    recorded runs as the robot suddenly spinning/stumbling mid-approach.
+    The commanded `yaw` is `target_yaw` slew-limited toward `last_yaw` (see
+    `_slew_yaw`, `reference_yaw_rate_max`) -- geometry can call for an
+    arbitrarily large heading change in one replan (e.g. a face switch), and
+    handing that straight to MPPI as an instantaneous target caused visible
+    snap-spins. `target_yaw` is still returned unsmoothed for logging, to
+    distinguish a deliberate rate-limited turn from a raw scheduler decision.
+
+    A free stage has no contact pose, so its `target_yaw` is inferred from the
+    planned velocity direction, or held at `last_yaw` when that velocity is
+    too small to give a meaningful direction (e.g. the free-mode approach
+    heuristic has just reached its intermediate waypoint) -- defaulting to a
+    fixed 0.0 there instead caused an early version to snap toward "face
+    world +x" whenever planned velocity dipped near zero.
     """
     stage = 0
     face_index = int(schedule.face_indices[stage])
