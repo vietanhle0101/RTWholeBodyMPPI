@@ -160,6 +160,7 @@ include_directories(
 ## in contrast to setup.py, you can choose the destination
 catkin_install_python(PROGRAMS
   scripts/run_mppi_locomanipulation.py
+  scripts/simulate_minlp_box_push.py
   scripts/run_mppi_locomotion.py
   scripts/simulate_mppi.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}

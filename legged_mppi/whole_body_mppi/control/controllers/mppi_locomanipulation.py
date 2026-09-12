@@ -42,7 +42,12 @@ class MPPI_box_push(BaseMPPI):
         self.follow_box = False
         self.task_data = get_task(task)
         self.goal_pos = self.task_data['goal_pos']
-        self.goal_ori = self.task_data['default_orientation'] 
+        self.goal_ori = self.task_data['default_orientation']
+        # When set, update() uses this orientation verbatim instead of the
+        # walk-toward-waypoint heuristic below -- e.g. a contact scheduler's
+        # push-face-aligned yaw, which the heuristic would otherwise clobber
+        # every step while the robot is still en route to body_ref.
+        self.external_ori = None
         self.cmd_vel = self.task_data['cmd_vel']
         self.goal_thresh = self.task_data['goal_thresh']
         self.desired_gait = self.task_data['desired_gait']
@@ -150,7 +155,9 @@ class MPPI_box_push(BaseMPPI):
         goal_delta = np.linalg.norm(direction)
 
         # Update desired orientation based on the goal position
-        if (goal_delta > 0.1) and ((self.gait_scheduler == self.gaits['walk']) or (self.gait_scheduler == self.gaits['trot'])): 
+        if self.external_ori is not None:
+            self.goal_ori = self.external_ori
+        elif (goal_delta > 0.1) and ((self.gait_scheduler == self.gaits['walk']) or (self.gait_scheduler == self.gaits['trot'])):
             self.goal_ori = calculate_orientation_quaternion(self.robot_state[:3], self.body_ref[:3])
         elif self.gait_scheduler == self.gaits['in_place']:
             self.goal_ori = np.array([1,0,0,0])

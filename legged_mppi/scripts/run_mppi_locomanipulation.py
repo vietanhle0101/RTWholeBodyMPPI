@@ -2,6 +2,8 @@ import rospy
 import argparse
 import numpy as np
 from whole_body_mppi.control.controllers.mppi_locomanipulation import MPPI_box_push
+from whole_body_mppi.control.contact_scheduler import BoxPlanarState, MinlpContactScheduler
+from whole_body_mppi.control.contact_scheduler.reference_adapter import pushing_reference
 from scipy.spatial.transform import Rotation as R
 
 from unitree_legged_msgs.msg import MotorState, MotorCmd
@@ -43,6 +45,8 @@ class Controller:
 
         self.box_pos = [3, 0, 0]
         self.box_ori = [1, 0, 0, 0]
+        self.box_vel = [0, 0, 0]
+        self.box_ang_vel = [0, 0, 0]
 
     def joint_state_callback(self, data, joint_name):
         self.joint_states[joint_name] = data
@@ -77,6 +81,9 @@ class Controller:
     def box_callback(self, data):
         self.box_pos = [data.pose.pose.position.x, data.pose.pose.position.y, data.pose.pose.position.z]
         self.box_ori = [data.pose.pose.orientation.w, data.pose.pose.orientation.x, data.pose.pose.orientation.y, data.pose.pose.orientation.z]
+        rotation = R.from_quat(np.array(self.box_ori)[[1,2,3,0]])
+        self.box_vel = rotation.apply([data.twist.twist.linear.x, data.twist.twist.linear.y, data.twist.twist.linear.z])
+        self.box_ang_vel = [data.twist.twist.angular.x, data.twist.twist.angular.y, data.twist.twist.angular.z]
 
     def setup_ros(self):
         joints = self.joint_states.keys()
@@ -112,6 +119,9 @@ class Controller:
             return
 
         mppi = MPPI_box_push(task)
+        scheduler = MinlpContactScheduler()
+        scheduler_period = 1.0 / scheduler.config['replan_rate_hz']
+        last_schedule_time = -np.inf
 
         mppi.internal_ref = True
         mppi.body_ref[:2] = self.body_xy
@@ -127,11 +137,28 @@ class Controller:
 
         while not rospy.is_shutdown():
             self.body_pos = [self.body_xy[0], self.body_xy[1], self.body_z[0]]
-            error = np.linalg.norm(np.array(mppi.body_ref[:3]) - np.array(self.body_pos))
-            
-            box_error = np.linalg.norm(mppi.box_state[:2] - mppi.x_box_ref[:2])
-            if error < 0.2 or box_error < 0.4:
-                mppi.next_goal()
+            now = rospy.get_time()
+            if now - last_schedule_time >= scheduler_period:
+                box_yaw = R.from_quat(np.array(self.box_ori)[[1,2,3,0]]).as_euler('xyz')[2]
+                schedule = scheduler.plan(
+                    BoxPlanarState(self.box_pos[0], self.box_pos[1], box_yaw,
+                                   self.box_vel[0], self.box_vel[1], self.box_ang_vel[2]),
+                    self.body_xy, mppi.x_box_ref[:2])
+                reference = pushing_reference(schedule, scheduler.config)
+                mppi.body_ref[:2] = reference.position
+                mppi.body_ref[2] = 0.24
+                mppi.body_ref[3:7] = [np.cos(reference.yaw / 2), 0, 0, np.sin(reference.yaw / 2)]
+                mppi.goal_ori = mppi.body_ref[3:7].copy()
+                # Pin this yaw so update()'s walk-toward-waypoint heuristic doesn't
+                # overwrite it before the next replan (see MPPI_box_push.update()).
+                mppi.external_ori = mppi.body_ref[3:7].copy()
+                mppi.body_ref[7:9] = reference.velocity
+                # The legacy task state machine used to switch from the
+                # initial in-place gait to walking.  The contact scheduler now
+                # owns that phase transition, while MPPI itself is unchanged.
+                mppi.gait_scheduler = mppi.gaits['walk']
+                rospy.loginfo_throttle(1.0, 'Contact scheduler: %s (%s)', reference.face, schedule.status)
+                last_schedule_time = now
 
             state[:3] = self.box_pos
             state[3:7] = self.box_ori
@@ -141,8 +168,8 @@ class Controller:
             state[17:20] = [self.joint_states["FL_hip"].q, self.joint_states["FL_thigh"].q, self.joint_states["FL_calf"].q]
             state[20:23] = [self.joint_states["RR_hip"].q, self.joint_states["RR_thigh"].q, self.joint_states["RR_calf"].q]
             state[23:26] = [self.joint_states["RL_hip"].q, self.joint_states["RL_thigh"].q, self.joint_states["RL_calf"].q]
-            state[26:29] = [0,0,0]
-            state[29:32] = [0,0,0]
+            state[26:29] = self.box_vel
+            state[29:32] = self.box_ang_vel
             state[32:35] = self.body_vel
             state[35:38] = self.body_ang_vel
             state[38:41] = [self.joint_states["FR_hip"].dq, self.joint_states["FR_thigh"].dq, self.joint_states["FR_calf"].dq]
