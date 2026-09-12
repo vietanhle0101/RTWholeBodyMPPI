@@ -1,132 +1,129 @@
-# High-Level MINLP Contact Scheduler for Go1 Box Pushing
+# Go1 Box-Pushing MINLP
 
-## Purpose and architecture
+## Role
 
-The high-level planner chooses when and where Go1 contacts one rectangular box.
-It predicts planar box motion, then sends only the **first future** Go1
-reference to the existing MPPI controller:
+`MinlpContactScheduler` is a receding-horizon planar contact planner for one
+Go1 and one rectangular box. It outputs only the first future body reference
+to the existing whole-body MPPI controller:
 
 $$
-\text{MINLP contact scheduler}\rightarrow(q_1^{\rm ref},\phi_{r,0}^{\rm ref},u_0)
-\rightarrow\text{whole-body MPPI}\rightarrow\text{MuJoCo}.
+(q_1^{\rm ref},\phi_r^{\rm ref},u_0)\quad\longrightarrow\quad\text{MPPI}.
 $$
 
-MPPI remains responsible for joint-level execution. The planned contact force
-is a reduced-order prediction variable; it is **not** directly commanded to
-MuJoCo or MPPI.
+The planned force predicts box motion; it is not a MuJoCo actuator command.
+MPPI remains responsible for whole-body execution.
 
-## State, modes, and geometry
+## Variables and modes
 
-The box state is
+The box state and Go1 planar reference are
 
 $$
 x_k^o=[p_{x,k},p_{y,k},\psi_k,v_{x,k},v_{y,k},\omega_k]^\top,
+\qquad q_k=[q_{x,k},q_{y,k}]^\top.
 $$
 
-and $q_k=[q_{x,k},q_{y,k}]^\top$ is the desired Go1 planar body position.
-Each solve fixes $x_0^o=\hat x_0^o$ and $q_0=\hat q_0$ from MuJoCo.
-The task goal is planar position $p_g\in\mathbb R^2$; terminal box yaw is
-unconstrained in this first version.
+The initial box state and Go1 position are measured from MuJoCo. The goal is
+the box planar position $p_g$; box terminal yaw is unconstrained.
 
-Candidate faces are $\mathcal S=\{\mathrm{rear},\mathrm{left},\mathrm{right}\}$.
-For face $s$, $r_s^0$, $n_s$, $t_s$, and $\ell_s$ are respectively its
-box-frame midpoint, outward normal, tangent, and half-length. Binary variables
-$z_{s,k}$ select pushing faces and $z_{\rm free,k}$ selects repositioning:
+Candidate faces are $\mathcal S=\{\mathrm{rear},\mathrm{left},
+\mathrm{right}\}$. Each contact block selects one face or free mode:
 
 $$
-z_{\rm free,k}+\sum_{s\in\mathcal S}z_{s,k}=1,
-\qquad z_{s,k},z_{\rm free,k}\in\{0,1\}.
+z_{\rm free,b}+\sum_{s\in\mathcal S}z_{s,b}=1,
+\qquad z_{\rm free,b},z_{s,b}\in\{0,1\}.
 $$
 
-The continuous contact location and normal-force magnitude obey
+For face midpoint $r_s^0$, outward normal $n_s$, tangent $t_s$, and half
+length $\ell_s$, the continuous contact variables satisfy
 
 $$
-r_{s,k}=r_s^0+\xi_{s,k}t_s,\quad
--\ell_s z_{s,k}\le\xi_{s,k}\le\ell_s z_{s,k},\quad
-0\le f_{s,k}\le f_{\max}z_{s,k}.
+r_{s,b}=r_s^0+\xi_{s,b}t_s,\quad
+|\xi_{s,b}|\le\ell_s z_{s,b},\quad
+0\le f_{s,b}\le f_{\max}z_{s,b}.
 $$
 
-With $R(\psi)$ the planar rotation matrix, predicted force and torque are
+Free mode permits repositioning without a contact-pose constraint.
+
+## Dynamics and contact geometry
+
+Let $R(\psi)$ be the planar rotation matrix. At fine dynamics step $k$, for
+block $b(k)$,
 
 $$
-F_{s,k}=-f_{s,k}R(\psi_k)n_s,\qquad
-\tau_{s,k}=[R(\psi_k)r_{s,k}]\times F_{s,k}.
+F_k=\sum_s-f_{s,b(k)}R(\psi_k)n_s,\qquad
+\tau_k=\sum_s[R(\psi_k)r_{s,b(k)}]\times[-f_{s,b(k)}R(\psi_k)n_s].
 $$
 
-Thus yaw creates nonlinear world-frame forces, while off-center contact
-($\xi_{s,k}\ne0$) generates yaw torque.
-
-## Dynamics and contact pose
-
-The reduced-order dynamics are
-
-$$
-\begin{aligned}
-p_{k+1}&=p_k+\Delta t\,v_k, &
-v_{k+1}&=v_k+\frac{\Delta t}{m}\left(\sum_sF_{s,k}-c_vv_k\right),\\
-\psi_{k+1}&=\psi_k+\Delta t\,\omega_k, &
-\omega_{k+1}&=\omega_k+\frac{\Delta t}{I}\left(\sum_s\tau_{s,k}-c_\omega\omega_k\right),\\
-q_{k+1}&=q_k+\Delta t\,u_k, & \|u_k\|_2&\le v_r^{\max}.
-\end{aligned}
-$$
-
-For an active face, the desired Go1 pushing pose is outside the box:
-
-$$
-q_{s,k}^{\rm push}=p_k+R(\psi_k)(r_{s,k}+d_rn_s),
-$$
-
-enforced componentwise with a big-$M$ tolerance:
-
-$$
--\epsilon-M(1-z_{s,k})\le q_k-q_{s,k}^{\rm push}
-\le\epsilon+M(1-z_{s,k}).
-$$
-
-The Go1 heading is computed after solving, avoiding `atan2` in the MINLP:
-
-$$
-\phi_{r,k}^{\rm ref}=\operatorname{atan2}(-[R(\psi_k)n_s]_y,
-                                             -[R(\psi_k)n_s]_x).
-$$
-
-## Objective
-
-With switching auxiliaries $\eta_{s,k}\ge|z_{s,k}-z_{s,k-1}|$, solve
+The box uses damped rigid-body Euler integration and Go1 reference motion uses
+a speed-limited integrator:
 
 $$
 \begin{aligned}
-\min\;J={}&\sum_{k=0}^{H-1}\big[
-(p_k-p_g)^\top Q_p(p_k-p_g)+q_v\|v_k\|^2+q_\omega\omega_k^2\\
-&\qquad+u_k^\top R_u u_k+r_f\sum_sf_{s,k}^2
-+\rho_{\rm sw}\sum_s\eta_{s,k}\big]\\
-&+(p_H-p_g)^\top Q_f(p_H-p_g).
+p_{k+1}&=p_k+\Delta t_d v_k,&
+v_{k+1}&=v_k+\frac{\Delta t_d}{m}(F_k-c_vv_k),\\
+\psi_{k+1}&=\psi_k+\Delta t_d\omega_k,&
+\omega_{k+1}&=\omega_k+\frac{\Delta t_d}{I}(\tau_k-c_\omega\omega_k),\\
+q_{k+1}&=q_k+\Delta t_d u_k,&\|u_k\|_2&\le v_r^{\max}.
 \end{aligned}
 $$
 
-subject to the dynamics, mode, force, contact-location, and pushing-pose
-constraints above. This is an MINLP because it includes binary modes and terms
-such as $f\cos\psi$, $f\sin\psi$, and $\xi f$.
+When face $s$ is active, Go1's reference point must be near its standoff pose:
 
-## Optional multi-rate form
+$$
+q_k\approx p_k+R(\psi_k)(r_{s,b(k)}+d_rn_s).
+$$
 
-The implementation supports fine dynamics timestep $\Delta t_d$ and coarser
-contact timestep $\Delta t_c=m\Delta t_d$. Box/robot states integrate at
-$\Delta t_d$; $z$, $f$, $\xi$, and $\eta$ are constant inside each contact
-block. Setting $m=1$ recovers the single-rate formulation. The current
-warm-start implementation requires the replan period to equal $\Delta t_c$.
+This is enforced componentwise with a $\pm\epsilon$ big-$M$ implication. The
+yaw-dependent force and off-centre torque make the problem nonlinear; the
+face binaries make it an MINLP.
 
-## Practical safeguards
+## Objective and continuity
 
-- If the heuristic-selected pushing pose is beyond the horizon's reachable
-  distance, command a straight-line free-mode approach before solving.
-- Shift the previous solution forward one contact block as a warm start.
-- Accept a time-limited BONMIN incumbent only if it is integer-feasible and
-  satisfies all constraints; otherwise use a nominal safe fallback.
-- Run BONMIN in a quiet worker process with an external hard deadline.
+The objective penalizes running/terminal box-goal error, box linear and yaw
+motion, Go1 reference speed, and squared force. Switching auxiliaries obey
 
-## Future replacement
+$$
+\eta_{s,b}\ge |z_{s,b}-z_{s,b-1}|.
+$$
 
-An L2O model may predict $\hat z(\hat x_0^o,\hat q_0,p_g)$ and a continuous
-warm start. With $z$ fixed, the MINLP becomes a continuous NLP that can be
-refined by unrolled SQP. The MPPI-facing interface remains unchanged.
+For $b=0$, $z_{s,-1}$ is the one-hot face issued by the preceding replan (or
+all zero for free mode). This cross-replan penalty prevents a first-stage face
+change from being free. Its weight is `initial_contact_switch`.
+
+## Timing, handoff, and safeguards
+
+Discrete contact variables, force, and location are constant for one contact
+period $\Delta t_c$. Box and robot-reference dynamics may integrate at a finer
+$\Delta t_d$, where $\Delta t_c=m\Delta t_d$. The replan period must equal
+$\Delta t_c$; the default is 0.2 s with five blocks (one-second lookahead).
+
+For an active face, the raw Go1 heading is the inward face normal:
+
+$$
+\phi_{\rm target}=\operatorname{atan2}(-[R(\psi)n_s]_y,
+                                         -[R(\psi)n_s]_x).
+$$
+
+Free mode targets its planned velocity direction, retaining the prior yaw at
+near-zero speed. Before MPPI receives either heading, it is slew-limited:
+
+$$
+\phi_{\rm cmd}=\phi_{\rm last}+
+\operatorname{clip}\!\left(\operatorname{wrap}(\phi_{\rm target}-\phi_{\rm last}),
+[-\dot\phi_{\max}\Delta t_c,\dot\phi_{\max}\Delta t_c]\right).
+$$
+
+The default $\dot\phi_{\max}=1.25$ rad/s limits a 5 Hz command change to
+0.25 rad. Raw and commanded yaw are logged.
+
+If the selected standoff pose is outside the short-horizon reachable distance,
+a free-mode straight-line approach is issued. The solver warm-starts from a
+shifted previous solution. A time-limited BONMIN result is accepted only when
+integer-feasible and constraint-feasible; otherwise a nominal fallback is
+used. BONMIN runs quietly in a worker with an external deadline.
+
+## Replacement path
+
+An L2O model can predict the mode sequence and continuous warm start. Fixing
+the predicted binaries converts this to an NLP that unrolled SQP can refine;
+the `ContactSchedule` and MPPI reference interface need not change.
