@@ -258,6 +258,16 @@ class MPPI_box_push(BaseMPPI):
         # Compute batch costs
         rotated_ref = batch_world_to_local_velocity(robot_state[:,3:7], robot_state[:,19:22])
         robot_state[:,19:22] = rotated_ref
+        # x_robot_ref's velocity slice (from body_ref[7:9], written by task
+        # code and the MINLP contact scheduler as a WORLD-frame planar
+        # velocity) must be expressed in the same frame as the measured
+        # velocity just rotated above, or x_error compares incompatible
+        # quantities whenever yaw != 0 (silently fine for straight-ahead
+        # walking, wrong for any push requiring real rotation -- e.g.
+        # left/right box faces). Rotate both by the robot's CURRENT
+        # orientation (not the reference orientation) so the comparison
+        # stays consistent even while still turning toward the reference.
+        x_robot_ref[:,19:22] = batch_world_to_local_velocity(robot_state[:,3:7], x_robot_ref[:,19:22])
         costs = self.quadruped_cost_np(robot_state, box_state, actions, x_robot_ref, self.x_box_ref)
         # Sum costs for each sample
         total_costs = costs.reshape(num_samples, num_pairs).sum(axis=1)

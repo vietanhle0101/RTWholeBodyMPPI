@@ -122,6 +122,7 @@ class Controller:
         scheduler = MinlpContactScheduler()
         scheduler_period = 1.0 / scheduler.config['replan_rate_hz']
         last_schedule_time = -np.inf
+        last_commanded_yaw = 0.0
 
         mppi.internal_ref = True
         mppi.body_ref[:2] = self.body_xy
@@ -144,7 +145,8 @@ class Controller:
                     BoxPlanarState(self.box_pos[0], self.box_pos[1], box_yaw,
                                    self.box_vel[0], self.box_vel[1], self.box_ang_vel[2]),
                     self.body_xy, mppi.x_box_ref[:2])
-                reference = pushing_reference(schedule, scheduler.config)
+                reference = pushing_reference(schedule, scheduler.config, last_commanded_yaw)
+                last_commanded_yaw = reference.yaw
                 mppi.body_ref[:2] = reference.position
                 mppi.body_ref[2] = 0.24
                 mppi.body_ref[3:7] = [np.cos(reference.yaw / 2), 0, 0, np.sin(reference.yaw / 2)]

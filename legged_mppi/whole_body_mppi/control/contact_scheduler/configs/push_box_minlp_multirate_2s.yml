@@ -1,0 +1,41 @@
+# High-level contact scheduler.  All dimensions are planar SI units.
+# Multi-rate variant: fine dynamics_dt for accurate box/robot state
+# integration, coarser contact_dt for the discrete face/force/location/
+# switching decisions (held constant within each contact_dt block). This
+# decouples "how accurately do we simulate" from "how many discrete choices
+# does BONMIN have to search over" -- horizon=4 blocks * contact_dt=0.5s
+# gives the same 2.0s lookahead as push_box_minlp_2s_fine.yml (dt=0.2,
+# horizon=10) but with only 4*4=16 discrete binaries instead of 44, while
+# still integrating dynamics at a finer 0.1s than even the 1s_base config.
+dynamics_dt: 0.1
+contact_dt: 0.5
+horizon: 4
+replan_rate_hz: 2.0
+# Cold solve of this scenario took ~13.4s to reach true optimality (vs.
+# 2s_fine timing out at 20s without even reaching an incumbent) -- give it
+# enough room to actually finish rather than habitually hitting the limit.
+solver_time_limit_s: 15.0
+
+box_half_length: 0.19
+box_half_width: 0.19
+box_mass: 3.70
+box_yaw_inertia: 0.0849
+linear_damping: 7.0
+angular_damping: 0.25
+
+robot_standoff: 0.34
+robot_speed_max: 0.25
+box_speed_max: 1.0
+box_yaw_rate_max: 2.0
+force_max: 50.0
+contact_tolerance: 0.04
+big_m: 10.0
+
+weights:
+  box_position: 150.0
+  terminal_box_position: 600.0
+  box_velocity: 2.0
+  box_yaw_rate: 0.5
+  robot_velocity: 2.0
+  force: 0.002
+  contact_switch: 1.0

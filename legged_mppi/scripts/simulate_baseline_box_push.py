@@ -29,16 +29,25 @@ def main() -> None:
     parser.add_argument("--box-x", type=float, default=0.6, help="Override the box's initial x position.")
     parser.add_argument("--box-y", type=float, default=0.0, help="Override the box's initial y position.")
     parser.add_argument("--goal-thresh", type=float, default=0.2, help="Box-to-goal distance counted as success.")
+    parser.add_argument("--save-data", default=None,
+                         help="Log qpos/goal/body_ref trajectory to this .npz, in the same schema "
+                              "simulate_minlp_box_push.py uses, so render_box_push.py can render "
+                              "either one for a like-for-like video comparison.")
     args = parser.parse_args()
 
     task = get_task(args.task)
     package_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    model = mujoco.MjModel.from_xml_path(os.path.join(package_dir, "whole_body_mppi", task["sim_path"]))
+    sim_path = os.path.join(package_dir, "whole_body_mppi", task["sim_path"])
+    model = mujoco.MjModel.from_xml_path(sim_path)
     data = mujoco.MjData(model)
     mujoco.mj_resetDataKeyframe(model, data, 0)
     data.qpos[0] = args.box_x
     data.qpos[1] = args.box_y
     mujoco.mj_forward(model, data)
+
+    log = None
+    if args.save_data is not None:
+        log = {"time": [], "qpos": [], "goal_xy": None, "body_ref_xy": [], "sim_path": sim_path}
 
     mppi = MPPI_box_push(args.task)
     mppi.internal_ref = True
@@ -47,6 +56,8 @@ def main() -> None:
     if args.goal_y is not None:
         mppi.x_box_ref[1] = args.goal_y
     print(f"Goal: {mppi.x_box_ref[:2]}")
+    if log is not None:
+        log["goal_xy"] = mppi.x_box_ref[:2].copy()
 
     steps = round(args.duration / model.opt.timestep)
     reached_at = None
@@ -69,10 +80,24 @@ def main() -> None:
             print(f"t={data.time:.2f}s box={data.qpos[:2]} robot={data.qpos[7:9]} "
                   f"body_ref={mppi.body_ref[:2]} follow_box={mppi.follow_box}")
 
+        if log is not None:
+            log["time"].append(data.time)
+            log["qpos"].append(data.qpos.copy())
+            log["body_ref_xy"].append(mppi.body_ref[:2].copy())
+
+        if reached_at is not None:
+            break
+
     final_box = data.qpos[:2].copy()
     final_distance = float(np.linalg.norm(final_box - mppi.x_box_ref[:2]))
     print(f"final box position: {final_box}, distance to goal: {final_distance:.3f}m")
     print(f"reached goal: {reached_at is not None}" + (f" at t={reached_at:.2f}s" if reached_at else ""))
+
+    if log is not None:
+        np.savez(args.save_data, time=np.array(log["time"]), qpos=np.array(log["qpos"]),
+                 goal_xy=log["goal_xy"], body_ref_xy=np.array(log["body_ref_xy"]),
+                 sim_path=log["sim_path"])
+        print(f"Saved trajectory data to {args.save_data}")
 
 
 if __name__ == "__main__":

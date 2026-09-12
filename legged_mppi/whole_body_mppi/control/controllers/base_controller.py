@@ -45,7 +45,8 @@ class BaseMPPI:
         self.h = params['dt']
         self.sample_type = params['sample_type']
         self.n_knots = params['n_knots']
-        self.random_generator = np.random.default_rng(params["seed"])
+        self.seed = params["seed"]
+        self.random_generator = np.random.default_rng(self.seed)
         self.rollout_func = self.threaded_rollout
         self.cost_func = self.calculate_total_cost
 
