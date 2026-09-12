@@ -15,6 +15,12 @@ angular_damping: 0.25
 
 robot_standoff: 0.34
 robot_speed_max: 0.25
+# Contact lifecycle: after engaging a face, remain in contact mode for at
+# least this long. Recover to free approach only after the standoff error has
+# exceeded reachable_distance + margin for this many consecutive replans.
+contact_min_hold_s: 1.0
+contact_release_margin: 0.10
+contact_release_replans: 3
 # The scheduler runs at 5 Hz, so 1.25 rad/s limits a new orientation command
 # to 0.25 rad per replan.  The raw face heading remains available in logs.
 reference_yaw_rate_max: 1.25

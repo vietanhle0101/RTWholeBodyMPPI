@@ -75,6 +75,32 @@ class MinlpContactScheduler:
         # change for free even though that change becomes a large yaw step at
         # the Go1 interface.
         self._previous_face_index = -1
+        # The approach heuristic is necessary when the desired standoff is
+        # outside the finite MINLP horizon.  It must not, however, override a
+        # newly established physical push because a single measured position
+        # happens to straddle that reachability boundary.
+        self._phase = "approach"
+        self._committed_face_index = -1
+        self._contact_hold_replans = 0
+        self._release_violations = 0
+        self._last_standoff_error = np.inf
+        self._min_contact_hold_replans = max(
+            0, int(np.ceil(float(self.config.get("contact_min_hold_s", 1.0)) / self.replan_period)))
+        self._contact_release_margin = float(self.config.get("contact_release_margin", 0.10))
+        self._contact_release_replans = max(1, int(self.config.get("contact_release_replans", 3)))
+        if self._contact_release_margin < 0.0:
+            raise ValueError("contact_release_margin must be non-negative")
+
+    @property
+    def diagnostics(self) -> Mapping[str, object]:
+        """State needed to diagnose approach/contact transitions in a log."""
+        return {
+            "phase": self._phase,
+            "committed_face_index": self._committed_face_index,
+            "standoff_error": self._last_standoff_error,
+            "contact_hold_replans": self._contact_hold_replans,
+            "release_violations": self._release_violations,
+        }
 
     def _build_solver(self) -> None:
         c = self.config
@@ -231,7 +257,7 @@ class MinlpContactScheduler:
         """Solve one short-horizon plan from the current measured state."""
         approach = self._approach_if_needed(box_state, robot_xy, goal_xy)
         if approach is not None:
-            return self._remember_issued_mode(approach)
+            return self._finalize_schedule(approach, box_state, robot_xy, goal_xy)
         parameters = np.r_[box_state.vector(), np.asarray(robot_xy, dtype=float), np.asarray(goal_xy, dtype=float),
                            self._previous_face_vector()]
         used_warm_start = self._last_solution is not None
@@ -239,7 +265,8 @@ class MinlpContactScheduler:
         try:
             values, success, status = self._solve(x0, parameters)
         except RuntimeError as error:
-            return self._remember_issued_mode(self._fallback(box_state, robot_xy, goal_xy, str(error)))
+            return self._finalize_schedule(self._fallback(box_state, robot_xy, goal_xy, str(error)),
+                                           box_state, robot_xy, goal_xy)
         if not success and status == "INFEASIBLE" and used_warm_start:
             # The warm start is the previous solve's trajectory shifted one
             # step -- a good guess only while the plan is still valid. Right
@@ -252,14 +279,17 @@ class MinlpContactScheduler:
                 if not success:
                     status = f"cold-retry: {status}"
             except RuntimeError as error:
-                return self._remember_issued_mode(self._fallback(box_state, robot_xy, goal_xy, str(error)))
+                return self._finalize_schedule(self._fallback(box_state, robot_xy, goal_xy, str(error)),
+                                               box_state, robot_xy, goal_xy)
         if not success:
             if status == "LIMIT_EXCEEDED" and self._is_feasible_incumbent(values, parameters):
                 self._last_solution = values.copy()
-                return self._remember_issued_mode(self._unpack(values, True, f"incumbent: {status}"))
-            return self._remember_issued_mode(self._fallback(box_state, robot_xy, goal_xy, status))
+                return self._finalize_schedule(self._unpack(values, True, f"incumbent: {status}"),
+                                               box_state, robot_xy, goal_xy)
+            return self._finalize_schedule(self._fallback(box_state, robot_xy, goal_xy, status),
+                                           box_state, robot_xy, goal_xy)
         self._last_solution = values.copy()
-        return self._remember_issued_mode(self._unpack(values, success, status))
+        return self._finalize_schedule(self._unpack(values, success, status), box_state, robot_xy, goal_xy)
 
     def _previous_face_vector(self) -> np.ndarray:
         """One-hot active face from the prior command; all zero denotes free."""
@@ -272,6 +302,34 @@ class MinlpContactScheduler:
         """Use the first mode actually handed downstream as the next boundary mode."""
         self._previous_face_index = int(schedule.face_indices[0]) if len(schedule.face_indices) else -1
         return schedule
+
+    def _finalize_schedule(self, schedule: ContactSchedule, box_state: BoxPlanarState,
+                           robot_xy: Sequence[float], goal_xy: Sequence[float]) -> ContactSchedule:
+        """Enforce contact hold before publishing the first scheduler stage."""
+        face_index = int(schedule.face_indices[0]) if len(schedule.face_indices) else -1
+        if self._phase == "hold" and self._committed_face_index >= 0:
+            # A free first stage immediately removes force from the MPPI
+            # reference.  Keep the committed contact while the lifecycle has
+            # not declared recovery, and defer a new face until the dwell time
+            # has elapsed.
+            hold_required = face_index < 0 or (
+                face_index != self._committed_face_index
+                and self._contact_hold_replans < self._min_contact_hold_replans)
+            if hold_required:
+                schedule = self._fallback(
+                    box_state, robot_xy, goal_xy, f"contact-hold: {schedule.status}",
+                    face_index=self._committed_face_index)
+                self._last_solution = None
+                face_index = self._committed_face_index
+            self._contact_hold_replans += 1
+
+        if face_index >= 0:
+            if self._phase != "hold" or face_index != self._committed_face_index:
+                self._phase = "hold"
+                self._committed_face_index = face_index
+                self._contact_hold_replans = 1
+                self._release_violations = 0
+        return self._remember_issued_mode(schedule)
 
     def _solve(self, x0: np.ndarray, parameters: np.ndarray):
         """Run one BONMIN solve in a subprocess and return (values, success, status).
@@ -415,35 +473,45 @@ class MinlpContactScheduler:
         return np.r_[box, robot, velocity, force, location, faces, free, switching]
 
     def _approach_if_needed(self, box_state: BoxPlanarState, robot_xy: Sequence[float], goal_xy: Sequence[float]) -> Optional[ContactSchedule]:
-        """Generate free-mode references until a short-horizon contact is reachable.
-
-        This is the explicit ``z_free`` mode in operational form.  It avoids
-        asking a short contact horizon to solve an impossible initial condition
-        when Go1 begins well away from the selected box face.
-        """
+        """Return free approach only before contact or after sustained loss."""
         robot_xy = np.asarray(robot_xy, dtype=float)
         goal_xy = np.asarray(goal_xy, dtype=float)
         direction = goal_xy - box_state.vector()[:2]
         if np.linalg.norm(direction) < 1e-6:
             return None
         direction /= np.linalg.norm(direction)
-        # Choose the face whose inward normal best points toward the box goal.
+        # Keep one approach face while repositioning. Re-selecting it from
+        # scratch each replan can make a near-tie look like mode flicker.
         yaw = box_state.yaw
         rotation = np.array([[np.cos(yaw), -np.sin(yaw)], [np.sin(yaw), np.cos(yaw)]])
         normals = np.array([[-1.0, 0.0], [0.0, 1.0], [0.0, -1.0]])
-        face_index = self._select_face(box_state.vector()[:2], yaw, robot_xy, direction)
+        face_index = (self._committed_face_index if self._committed_face_index >= 0
+                      else self._select_face(box_state.vector()[:2], yaw, robot_xy, direction))
         midpoint = ((-self.config["box_half_length"], 0.0), (0.0, self.config["box_half_width"]),
                     (0.0, -self.config["box_half_width"]))[face_index]
         contact_pose = box_state.vector()[:2] + rotation @ (np.asarray(midpoint) + self.config["robot_standoff"] * normals[face_index])
         reachable_distance = self.horizon * self.dt * self.config["robot_speed_max"]
-        # Tried adding hysteresis here (engage at reachable_distance, only
-        # disengage past a wider threshold) to fix flicker between this
-        # heuristic and real planning near the boundary. Measured mixed
-        # results across goals (some improved, some got clearly worse --
-        # e.g. fixed_lateral 0.272m -> 0.929m) rather than a net improvement,
-        # so reverted to the single-threshold version.
+        self._last_standoff_error = float(np.linalg.norm(contact_pose - robot_xy))
+
+        if self._phase == "hold":
+            release_distance = reachable_distance + self._contact_release_margin
+            if (self._contact_hold_replans >= self._min_contact_hold_replans
+                    and self._last_standoff_error > release_distance):
+                self._release_violations += 1
+            else:
+                self._release_violations = 0
+            if self._release_violations < self._contact_release_replans:
+                # Invoke the MINLP; _finalize_schedule prevents a one-cycle
+                # free result from cancelling a sustained physical push.
+                return None
+            self._phase = "approach"
+            self._contact_hold_replans = 0
+            self._release_violations = 0
+            self._last_solution = None
+
         if np.linalg.norm(contact_pose - robot_xy) <= reachable_distance:
             return None
+        self._committed_face_index = face_index
         h = self.horizon
         delta = contact_pose - robot_xy
         velocity = delta / max(np.linalg.norm(delta), 1e-9) * self.config["robot_speed_max"]
@@ -476,8 +544,9 @@ class MinlpContactScheduler:
         return ContactSchedule(box[block_boundaries], robot[block_boundaries],
                                velocity[block_boundaries[:-1]], force, location, face_indices, success, status)
 
-    def _fallback(self, box_state: BoxPlanarState, robot_xy: Sequence[float], goal_xy: Sequence[float], status: str) -> ContactSchedule:
-        """Safe free-mode fallback if a MINLP solve fails or reaches its time limit."""
+    def _fallback(self, box_state: BoxPlanarState, robot_xy: Sequence[float], goal_xy: Sequence[float], status: str,
+                  face_index: Optional[int] = None) -> ContactSchedule:
+        """Return a nominal contact reference after a failed solve or hold override."""
         h = self.horizon
         box = np.zeros((h + 1, 6)); box[0] = box_state.vector()
         robot = np.zeros((h + 1, 2)); robot[0] = np.asarray(robot_xy, dtype=float)
@@ -485,12 +554,15 @@ class MinlpContactScheduler:
         force = np.zeros((h, self.FACE_COUNT))
         locations = np.zeros((h, self.FACE_COUNT))
         faces = np.zeros(h, dtype=int)
-        goal_direction = np.asarray(goal_xy, dtype=float) - box[0, :2]
-        if np.linalg.norm(goal_direction) < 1e-6:
-            return ContactSchedule(box, robot, velocity, force, locations, -np.ones(h, dtype=int), False, status)
-        goal_direction /= np.linalg.norm(goal_direction)
         normals = np.array([[-1.0, 0.0], [0.0, 1.0], [0.0, -1.0]])
-        face_index = self._select_face(box[0, :2], box[0, 2], np.asarray(robot_xy, dtype=float), goal_direction)
+        if face_index is None:
+            goal_direction = np.asarray(goal_xy, dtype=float) - box[0, :2]
+            if np.linalg.norm(goal_direction) < 1e-6:
+                return ContactSchedule(box, robot, velocity, force, locations, -np.ones(h, dtype=int), False, status)
+            goal_direction /= np.linalg.norm(goal_direction)
+            face_index = self._select_face(box[0, :2], box[0, 2], np.asarray(robot_xy, dtype=float), goal_direction)
+        if not 0 <= face_index < self.FACE_COUNT:
+            raise ValueError(f"invalid contact face index: {face_index}")
         midpoint = np.array(((-self.config["box_half_length"], 0.0), (0.0, self.config["box_half_width"]),
                              (0.0, -self.config["box_half_width"]))[face_index])
         nominal_force = min(float(self.config["force_max"]), 10.0)
@@ -507,4 +579,5 @@ class MinlpContactScheduler:
             velocity[k] = (robot[k + 1] - robot[k]) / self.dt
             force[k, face_index] = nominal_force
             faces[k] = face_index
-        return ContactSchedule(box, robot, velocity, force, locations, faces, False, f"fallback: {status}")
+        result_status = status if status.startswith("contact-hold:") else f"fallback: {status}"
+        return ContactSchedule(box, robot, velocity, force, locations, faces, False, result_status)

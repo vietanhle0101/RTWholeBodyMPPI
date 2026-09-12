@@ -68,6 +68,8 @@ def main() -> None:
                "replan_time": [], "replan_status": [], "replan_face": [], "replan_face_index": [],
                "replan_force": [], "replan_contact_location": [], "replan_yaw": [],
                "replan_target_yaw": [], "replan_yaw_step": [], "replan_robot_yaw": [],
+               "replan_phase": [], "replan_committed_face_index": [], "replan_standoff_error": [],
+               "replan_contact_hold_replans": [], "replan_release_violations": [],
                "replan_velocity": [], "replan_position": [], "replan_solve_time": []}
 
     mppi = MPPI_box_push(args.task)
@@ -90,7 +92,8 @@ def main() -> None:
     steps = round(args.duration / model.opt.timestep)
     action = np.zeros(model.nu)
 
-    status_counts = {"exact_success": 0, "incumbent": 0, "fallback": 0, "free_mode_approach": 0}
+    status_counts = {"exact_success": 0, "incumbent": 0, "fallback": 0,
+                     "free_mode_approach": 0, "contact_hold": 0}
     mode_switches = 0  # any change in face_index, including to/from free (-1)
     face_switches = 0  # only transitions between two distinct *active* faces
     prev_face_index = None
@@ -107,6 +110,7 @@ def main() -> None:
             schedule = scheduler.plan(
                 BoxPlanarState(data.qpos[0], data.qpos[1], yaw, data.qvel[0], data.qvel[1], data.qvel[5]),
                 data.qpos[7:9], mppi.x_box_ref[:2])
+            diagnostics = scheduler.diagnostics
             solve_time = time.perf_counter() - solve_start
             cumulative_solver_time += solve_time
             robot_yaw = _yaw_from_quat(data.qpos[10:14])
@@ -127,6 +131,7 @@ def main() -> None:
             mppi.gait_scheduler = mppi.gaits["walk"]
             print(f"t={data.time:.2f}s robot={data.qpos[7:9]} ref={reference.position} "
                   f"face={reference.face} yaw={reference.yaw:.2f}/{reference.target_yaw:.2f} "
+                  f"phase={diagnostics['phase']} standoff={diagnostics['standoff_error']:.3f} "
                   f"status={schedule.status}")
 
             face_index = int(schedule.active_faces[0]) if len(schedule.active_faces) else -1
@@ -142,6 +147,8 @@ def main() -> None:
                 status_counts["fallback"] += 1
             elif schedule.status == "free-mode approach":
                 status_counts["free_mode_approach"] += 1
+            elif schedule.status.startswith("contact-hold"):
+                status_counts["contact_hold"] += 1
             if prev_face_index is not None and face_index != prev_face_index:
                 mode_switches += 1
                 if prev_face_index >= 0 and face_index >= 0:
@@ -159,6 +166,11 @@ def main() -> None:
                 log["replan_target_yaw"].append(reference.target_yaw)
                 log["replan_yaw_step"].append(yaw_step)
                 log["replan_robot_yaw"].append(robot_yaw)
+                log["replan_phase"].append(diagnostics["phase"])
+                log["replan_committed_face_index"].append(diagnostics["committed_face_index"])
+                log["replan_standoff_error"].append(diagnostics["standoff_error"])
+                log["replan_contact_hold_replans"].append(diagnostics["contact_hold_replans"])
+                log["replan_release_violations"].append(diagnostics["release_violations"])
                 log["replan_velocity"].append(np.asarray(reference.velocity, dtype=float).copy())
                 log["replan_position"].append(np.asarray(reference.position, dtype=float).copy())
                 log["replan_solve_time"].append(solve_time)
@@ -219,6 +231,11 @@ def main() -> None:
             replan_target_yaw=np.array(log["replan_target_yaw"]),
             replan_yaw_step=np.array(log["replan_yaw_step"]),
             replan_robot_yaw=np.array(log["replan_robot_yaw"]),
+            replan_phase=np.array(log["replan_phase"], dtype=object),
+            replan_committed_face_index=np.array(log["replan_committed_face_index"]),
+            replan_standoff_error=np.array(log["replan_standoff_error"]),
+            replan_contact_hold_replans=np.array(log["replan_contact_hold_replans"]),
+            replan_release_violations=np.array(log["replan_release_violations"]),
             replan_velocity=np.array(log["replan_velocity"]),
             replan_position=np.array(log["replan_position"]),
             replan_solve_time=np.array(log["replan_solve_time"]),
