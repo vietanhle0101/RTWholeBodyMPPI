@@ -70,6 +70,11 @@ class MinlpContactScheduler:
         # enough to occasionally hit solver_time_limit_s and gave it no
         # incentive to keep pursuing a left/right face switch across calls).
         self._last_solution: Optional[np.ndarray] = None
+        # The previous *issued* mode is a solver parameter on the next call.
+        # Without it, the first face in every receding-horizon problem can
+        # change for free even though that change becomes a large yaw step at
+        # the Go1 interface.
+        self._previous_face_index = -1
 
     def _build_solver(self) -> None:
         c = self.config
@@ -97,6 +102,7 @@ class MinlpContactScheduler:
 
         initial = ca.MX.sym("initial", 8)  # box state followed by measured robot xy
         goal = ca.MX.sym("goal", 2)
+        previous_face = ca.MX.sym("previous_face", self.FACE_COUNT)
         g, lower, upper = [], [], []
 
         def constrain(expression, lb=0.0, ub=0.0):
@@ -136,10 +142,10 @@ class MinlpContactScheduler:
         # contact_dt block, not per fine dynamics step).
         for b in range(blocks):
             constrain(ca.sum1(face[:, b]) + free[0, b], 1.0, 1.0)
-            if b:
-                for s in range(self.FACE_COUNT):
-                    constrain(switching[s, b] - face[s, b] + face[s, b - 1], 0.0, np.inf)
-                    constrain(switching[s, b] + face[s, b] - face[s, b - 1], 0.0, np.inf)
+            preceding_face = previous_face if b == 0 else face[:, b - 1]
+            for s in range(self.FACE_COUNT):
+                constrain(switching[s, b] - face[s, b] + preceding_face[s], 0.0, np.inf)
+                constrain(switching[s, b] + face[s, b] - preceding_face[s], 0.0, np.inf)
             for s in range(self.FACE_COUNT):
                 # force[s,b] >= 0 and switching[s,b] >= 0 are plain bounds on
                 # raw decision variables -- set on _lbx below instead of as
@@ -147,7 +153,9 @@ class MinlpContactScheduler:
                 constrain(force[s, b] - force_max * face[s, b], -np.inf, 0.0)
                 constrain(location[s, b] - half_face_lengths[s] * face[s, b], -np.inf, 0.0)
                 constrain(location[s, b] + half_face_lengths[s] * face[s, b], 0.0, np.inf)
-            objective += weight["force"] * ca.sumsqr(force[:, b]) + weight["contact_switch"] * ca.sum1(switching[:, b])
+            switch_weight = (weight.get("initial_contact_switch", 8.0 * weight["contact_switch"])
+                             if b == 0 else weight["contact_switch"])
+            objective += weight["force"] * ca.sumsqr(force[:, b]) + switch_weight * ca.sum1(switching[:, b])
 
         # Fine-resolution dynamics and contact-geometry constraints.
         for k in range(n):
@@ -188,7 +196,7 @@ class MinlpContactScheduler:
         for index in range(self._face_slice_start, self._free_slice_start + blocks):
             discrete[index] = True
         self._solver = ca.nlpsol("contact_scheduler", "bonmin", {"x": decision, "f": objective,
-                                  "g": ca.vertcat(*g), "p": ca.vertcat(initial, goal)},
+                                  "g": ca.vertcat(*g), "p": ca.vertcat(initial, goal, previous_face)},
                                  {"discrete": discrete, "print_time": False,
                                   "bonmin": {"time_limit": float(c["solver_time_limit_s"]),
                                              "bb_log_level": 0, "nlp_log_level": 0,
@@ -197,7 +205,7 @@ class MinlpContactScheduler:
         # (see plan()) -- BONMIN reports "success" only for a proven-optimal
         # termination, but on LIMIT_EXCEEDED it still returns its best
         # feasible incumbent when the search found one at all.
-        self._g_func = ca.Function("g", [decision, ca.vertcat(initial, goal)], [ca.vertcat(*g)])
+        self._g_func = ca.Function("g", [decision, ca.vertcat(initial, goal, previous_face)], [ca.vertcat(*g)])
         self._lbg, self._ubg = np.asarray(lower), np.asarray(upper)
         self._lbx = np.full(self._decision_size, -np.inf)
         self._ubx = np.full(self._decision_size, np.inf)
@@ -223,14 +231,15 @@ class MinlpContactScheduler:
         """Solve one short-horizon plan from the current measured state."""
         approach = self._approach_if_needed(box_state, robot_xy, goal_xy)
         if approach is not None:
-            return approach
-        parameters = np.r_[box_state.vector(), np.asarray(robot_xy, dtype=float), np.asarray(goal_xy, dtype=float)]
+            return self._remember_issued_mode(approach)
+        parameters = np.r_[box_state.vector(), np.asarray(robot_xy, dtype=float), np.asarray(goal_xy, dtype=float),
+                           self._previous_face_vector()]
         used_warm_start = self._last_solution is not None
         x0 = self._warm_start(box_state, robot_xy) if used_warm_start else self._initial_guess(box_state, robot_xy)
         try:
             values, success, status = self._solve(x0, parameters)
         except RuntimeError as error:
-            return self._fallback(box_state, robot_xy, goal_xy, str(error))
+            return self._remember_issued_mode(self._fallback(box_state, robot_xy, goal_xy, str(error)))
         if not success and status == "INFEASIBLE" and used_warm_start:
             # The warm start is the previous solve's trajectory shifted one
             # step -- a good guess only while the plan is still valid. Right
@@ -243,14 +252,26 @@ class MinlpContactScheduler:
                 if not success:
                     status = f"cold-retry: {status}"
             except RuntimeError as error:
-                return self._fallback(box_state, robot_xy, goal_xy, str(error))
+                return self._remember_issued_mode(self._fallback(box_state, robot_xy, goal_xy, str(error)))
         if not success:
             if status == "LIMIT_EXCEEDED" and self._is_feasible_incumbent(values, parameters):
                 self._last_solution = values.copy()
-                return self._unpack(values, True, f"incumbent: {status}")
-            return self._fallback(box_state, robot_xy, goal_xy, status)
+                return self._remember_issued_mode(self._unpack(values, True, f"incumbent: {status}"))
+            return self._remember_issued_mode(self._fallback(box_state, robot_xy, goal_xy, status))
         self._last_solution = values.copy()
-        return self._unpack(values, success, status)
+        return self._remember_issued_mode(self._unpack(values, success, status))
+
+    def _previous_face_vector(self) -> np.ndarray:
+        """One-hot active face from the prior command; all zero denotes free."""
+        previous = np.zeros(self.FACE_COUNT)
+        if 0 <= self._previous_face_index < self.FACE_COUNT:
+            previous[self._previous_face_index] = 1.0
+        return previous
+
+    def _remember_issued_mode(self, schedule: ContactSchedule) -> ContactSchedule:
+        """Use the first mode actually handed downstream as the next boundary mode."""
+        self._previous_face_index = int(schedule.face_indices[0]) if len(schedule.face_indices) else -1
+        return schedule
 
     def _solve(self, x0: np.ndarray, parameters: np.ndarray):
         """Run one BONMIN solve in a subprocess and return (values, success, status).

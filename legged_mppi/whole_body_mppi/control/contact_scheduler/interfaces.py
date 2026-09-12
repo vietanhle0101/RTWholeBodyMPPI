@@ -30,6 +30,10 @@ class Go1PushReference:
     velocity: np.ndarray
     face: str
     force: float
+    # Face geometry supplies this unsmoothed heading.  `yaw` is the bounded
+    # command actually handed to MPPI, so logging both distinguishes a
+    # deliberate rate limit from a scheduler mode change.
+    target_yaw: float = 0.0
 
 
 @dataclass(frozen=True)

@@ -15,6 +15,9 @@ angular_damping: 0.25
 
 robot_standoff: 0.34
 robot_speed_max: 0.25
+# The scheduler runs at 5 Hz, so 1.25 rad/s limits a new orientation command
+# to 0.25 rad per replan.  The raw face heading remains available in logs.
+reference_yaw_rate_max: 1.25
 box_speed_max: 1.0
 box_yaw_rate_max: 2.0
 force_max: 50.0
@@ -29,3 +32,7 @@ weights:
   robot_velocity: 2.0
   force: 0.002
   contact_switch: 1.0
+  # Applied at the boundary between successive receding-horizon solves.
+  # Larger than the within-plan value because an abrupt face change forces a
+  # large Go1 heading change and is not represented by the planar box model.
+  initial_contact_switch: 8.0

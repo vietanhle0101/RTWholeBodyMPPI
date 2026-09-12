@@ -122,7 +122,7 @@ class Controller:
         scheduler = MinlpContactScheduler()
         scheduler_period = 1.0 / scheduler.config['replan_rate_hz']
         last_schedule_time = -np.inf
-        last_commanded_yaw = 0.0
+        last_commanded_yaw = R.from_quat(np.array(self.body_ori)[[1,2,3,0]]).as_euler('xyz')[2]
 
         mppi.internal_ref = True
         mppi.body_ref[:2] = self.body_xy

@@ -21,6 +21,11 @@ def _yaw_from_quat(qpos_quat: np.ndarray) -> float:
     return Rotation.from_quat(qpos_quat[[1, 2, 3, 0]]).as_euler("xyz")[2]
 
 
+def _angle_delta(target: float, source: float) -> float:
+    """Signed shortest yaw change from `source` to `target`."""
+    return float(np.arctan2(np.sin(target - source), np.cos(target - source)))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--duration", type=float, default=10.0)
@@ -62,6 +67,7 @@ def main() -> None:
         log = {"time": [], "qpos": [], "goal_xy": None, "body_ref_xy": [], "sim_path": sim_path,
                "replan_time": [], "replan_status": [], "replan_face": [], "replan_face_index": [],
                "replan_force": [], "replan_contact_location": [], "replan_yaw": [],
+               "replan_target_yaw": [], "replan_yaw_step": [], "replan_robot_yaw": [],
                "replan_velocity": [], "replan_position": [], "replan_solve_time": []}
 
     mppi = MPPI_box_push(args.task)
@@ -89,7 +95,10 @@ def main() -> None:
     face_switches = 0  # only transitions between two distinct *active* faces
     prev_face_index = None
     cumulative_solver_time = 0.0
-    last_commanded_yaw = 0.0
+    # Begin the slew limiter at the actual robot yaw, not an arbitrary world
+    # heading.  Robot free-joint quaternion follows the box free joint.
+    last_commanded_yaw = _yaw_from_quat(data.qpos[10:14])
+    yaw_steps = []
 
     for step in range(steps):
         if step % scheduler_steps == 0:
@@ -100,8 +109,11 @@ def main() -> None:
                 data.qpos[7:9], mppi.x_box_ref[:2])
             solve_time = time.perf_counter() - solve_start
             cumulative_solver_time += solve_time
+            robot_yaw = _yaw_from_quat(data.qpos[10:14])
             reference = pushing_reference(schedule, scheduler.config, last_commanded_yaw)
+            yaw_step = _angle_delta(reference.yaw, last_commanded_yaw)
             last_commanded_yaw = reference.yaw
+            yaw_steps.append(yaw_step)
             mppi.body_ref[:2] = reference.position
             mppi.body_ref[2] = 0.27
             mppi.body_ref[3:7] = [np.cos(reference.yaw / 2), 0.0, 0.0, np.sin(reference.yaw / 2)]
@@ -114,7 +126,8 @@ def main() -> None:
             # that selected walking after the initial in-place stance.
             mppi.gait_scheduler = mppi.gaits["walk"]
             print(f"t={data.time:.2f}s robot={data.qpos[7:9]} ref={reference.position} "
-                  f"face={reference.face} status={schedule.status}")
+                  f"face={reference.face} yaw={reference.yaw:.2f}/{reference.target_yaw:.2f} "
+                  f"status={schedule.status}")
 
             face_index = int(schedule.active_faces[0]) if len(schedule.active_faces) else -1
             if face_index >= 0:
@@ -143,6 +156,9 @@ def main() -> None:
                 log["replan_force"].append(reference.force)
                 log["replan_contact_location"].append(contact_location)
                 log["replan_yaw"].append(reference.yaw)
+                log["replan_target_yaw"].append(reference.target_yaw)
+                log["replan_yaw_step"].append(yaw_step)
+                log["replan_robot_yaw"].append(robot_yaw)
                 log["replan_velocity"].append(np.asarray(reference.velocity, dtype=float).copy())
                 log["replan_position"].append(np.asarray(reference.position, dtype=float).copy())
                 log["replan_solve_time"].append(solve_time)
@@ -176,6 +192,7 @@ def main() -> None:
         "num_replans": sum(status_counts.values()),
         "status_counts": status_counts,
         "cumulative_solver_time_s": cumulative_solver_time,
+        "max_commanded_yaw_step_rad": float(np.max(np.abs(yaw_steps))) if yaw_steps else 0.0,
     }
 
     print("final box position:", final_box_xy)
@@ -184,6 +201,7 @@ def main() -> None:
     print(f"mode switches: {mode_switches} (face switches: {face_switches}), "
           f"replans: {summary['num_replans']} ({status_counts}), "
           f"cumulative solver time: {cumulative_solver_time:.1f}s")
+    print(f"max commanded yaw step: {summary['max_commanded_yaw_step_rad']:.3f} rad")
 
     if log is not None:
         np.savez(
@@ -198,6 +216,9 @@ def main() -> None:
             replan_force=np.array(log["replan_force"]),
             replan_contact_location=np.array(log["replan_contact_location"]),
             replan_yaw=np.array(log["replan_yaw"]),
+            replan_target_yaw=np.array(log["replan_target_yaw"]),
+            replan_yaw_step=np.array(log["replan_yaw_step"]),
+            replan_robot_yaw=np.array(log["replan_robot_yaw"]),
             replan_velocity=np.array(log["replan_velocity"]),
             replan_position=np.array(log["replan_position"]),
             replan_solve_time=np.array(log["replan_solve_time"]),
