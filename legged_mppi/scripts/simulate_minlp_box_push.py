@@ -93,7 +93,7 @@ def main() -> None:
     action = np.zeros(model.nu)
 
     status_counts = {"exact_success": 0, "incumbent": 0, "fallback": 0,
-                     "free_mode_approach": 0, "contact_hold": 0}
+                     "free_mode_approach": 0}
     mode_switches = 0  # any change in face_index, including to/from free (-1)
     face_switches = 0  # only transitions between two distinct *active* faces
     prev_face_index = None
@@ -147,8 +147,6 @@ def main() -> None:
                 status_counts["fallback"] += 1
             elif schedule.status == "free-mode approach":
                 status_counts["free_mode_approach"] += 1
-            elif schedule.status.startswith("contact-hold"):
-                status_counts["contact_hold"] += 1
             if prev_face_index is not None and face_index != prev_face_index:
                 mode_switches += 1
                 if prev_face_index >= 0 and face_index >= 0:

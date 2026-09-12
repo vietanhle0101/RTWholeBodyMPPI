@@ -122,10 +122,12 @@ shifted previous solution. A time-limited BONMIN result is accepted only when
 integer-feasible and constraint-feasible; otherwise a nominal fallback is
 used. BONMIN runs quietly in a worker with an external deadline.
 
-After a face first becomes active, the scheduler enters contact hold: a free
-first stage is replaced by a nominal reference on the committed face. Recovery
-to free approach requires the minimum hold time and consecutive standoff-error
-violations above reachable distance plus the configured release margin.
+After a face first becomes active, the scheduler enters contact hold: the
+external reachability heuristic cannot immediately override it. A free stage
+selected by the MINLP is still passed through as an intentional regrasp.
+Recovery to heuristic free approach requires the minimum hold time and
+consecutive standoff-error violations above reachable distance plus the
+configured release margin.
 
 ## Replacement path
 

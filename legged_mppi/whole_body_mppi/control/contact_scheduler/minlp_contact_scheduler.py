@@ -305,22 +305,14 @@ class MinlpContactScheduler:
 
     def _finalize_schedule(self, schedule: ContactSchedule, box_state: BoxPlanarState,
                            robot_xy: Sequence[float], goal_xy: Sequence[float]) -> ContactSchedule:
-        """Enforce contact hold before publishing the first scheduler stage."""
+        """Track contact hold without overriding an intentional MINLP regrasp."""
         face_index = int(schedule.face_indices[0]) if len(schedule.face_indices) else -1
-        if self._phase == "hold" and self._committed_face_index >= 0:
-            # A free first stage immediately removes force from the MPPI
-            # reference.  Keep the committed contact while the lifecycle has
-            # not declared recovery, and defer a new face until the dwell time
-            # has elapsed.
-            hold_required = face_index < 0 or (
-                face_index != self._committed_face_index
-                and self._contact_hold_replans < self._min_contact_hold_replans)
-            if hold_required:
-                schedule = self._fallback(
-                    box_state, robot_xy, goal_xy, f"contact-hold: {schedule.status}",
-                    face_index=self._committed_face_index)
-                self._last_solution = None
-                face_index = self._committed_face_index
+        if self._phase == "hold":
+            # Hold suppresses only the out-of-MINLP reachability heuristic.
+            # A free first stage from BONMIN is an intentional regrasp and
+            # must reach MPPI unchanged; replacing it with a synthetic,
+            # centred rear push discarded the optimized contact offset and
+            # prevented lateral progress on shallow goals.
             self._contact_hold_replans += 1
 
         if face_index >= 0:
@@ -544,9 +536,8 @@ class MinlpContactScheduler:
         return ContactSchedule(box[block_boundaries], robot[block_boundaries],
                                velocity[block_boundaries[:-1]], force, location, face_indices, success, status)
 
-    def _fallback(self, box_state: BoxPlanarState, robot_xy: Sequence[float], goal_xy: Sequence[float], status: str,
-                  face_index: Optional[int] = None) -> ContactSchedule:
-        """Return a nominal contact reference after a failed solve or hold override."""
+    def _fallback(self, box_state: BoxPlanarState, robot_xy: Sequence[float], goal_xy: Sequence[float], status: str) -> ContactSchedule:
+        """Return a nominal contact reference after a failed solve."""
         h = self.horizon
         box = np.zeros((h + 1, 6)); box[0] = box_state.vector()
         robot = np.zeros((h + 1, 2)); robot[0] = np.asarray(robot_xy, dtype=float)
@@ -555,14 +546,11 @@ class MinlpContactScheduler:
         locations = np.zeros((h, self.FACE_COUNT))
         faces = np.zeros(h, dtype=int)
         normals = np.array([[-1.0, 0.0], [0.0, 1.0], [0.0, -1.0]])
-        if face_index is None:
-            goal_direction = np.asarray(goal_xy, dtype=float) - box[0, :2]
-            if np.linalg.norm(goal_direction) < 1e-6:
-                return ContactSchedule(box, robot, velocity, force, locations, -np.ones(h, dtype=int), False, status)
-            goal_direction /= np.linalg.norm(goal_direction)
-            face_index = self._select_face(box[0, :2], box[0, 2], np.asarray(robot_xy, dtype=float), goal_direction)
-        if not 0 <= face_index < self.FACE_COUNT:
-            raise ValueError(f"invalid contact face index: {face_index}")
+        goal_direction = np.asarray(goal_xy, dtype=float) - box[0, :2]
+        if np.linalg.norm(goal_direction) < 1e-6:
+            return ContactSchedule(box, robot, velocity, force, locations, -np.ones(h, dtype=int), False, status)
+        goal_direction /= np.linalg.norm(goal_direction)
+        face_index = self._select_face(box[0, :2], box[0, 2], np.asarray(robot_xy, dtype=float), goal_direction)
         midpoint = np.array(((-self.config["box_half_length"], 0.0), (0.0, self.config["box_half_width"]),
                              (0.0, -self.config["box_half_width"]))[face_index])
         nominal_force = min(float(self.config["force_max"]), 10.0)
@@ -579,5 +567,4 @@ class MinlpContactScheduler:
             velocity[k] = (robot[k + 1] - robot[k]) / self.dt
             force[k, face_index] = nominal_force
             faces[k] = face_index
-        result_status = status if status.startswith("contact-hold:") else f"fallback: {status}"
-        return ContactSchedule(box, robot, velocity, force, locations, faces, False, result_status)
+        return ContactSchedule(box, robot, velocity, force, locations, faces, False, f"fallback: {status}")
