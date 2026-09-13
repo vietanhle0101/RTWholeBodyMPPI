@@ -93,7 +93,7 @@ def main() -> None:
     action = np.zeros(model.nu)
 
     status_counts = {"exact_success": 0, "incumbent": 0, "fallback": 0,
-                     "free_mode_approach": 0}
+                     "free_mode_approach": 0, "align": 0}
     mode_switches = 0  # any change in face_index, including to/from free (-1)
     face_switches = 0  # only transitions between two distinct *active* faces
     prev_face_index = None
@@ -106,14 +106,14 @@ def main() -> None:
     for step in range(steps):
         if step % scheduler_steps == 0:
             yaw = _yaw_from_quat(data.qpos[3:7])
+            robot_yaw = _yaw_from_quat(data.qpos[10:14])
             solve_start = time.perf_counter()
             schedule = scheduler.plan(
                 BoxPlanarState(data.qpos[0], data.qpos[1], yaw, data.qvel[0], data.qvel[1], data.qvel[5]),
-                data.qpos[7:9], mppi.x_box_ref[:2])
+                data.qpos[7:9], mppi.x_box_ref[:2], robot_yaw=robot_yaw)
             diagnostics = scheduler.diagnostics
             solve_time = time.perf_counter() - solve_start
             cumulative_solver_time += solve_time
-            robot_yaw = _yaw_from_quat(data.qpos[10:14])
             reference = pushing_reference(schedule, scheduler.config, last_commanded_yaw)
             yaw_step = _angle_delta(reference.yaw, last_commanded_yaw)
             last_commanded_yaw = reference.yaw
@@ -147,6 +147,8 @@ def main() -> None:
                 status_counts["fallback"] += 1
             elif schedule.status == "free-mode approach":
                 status_counts["free_mode_approach"] += 1
+            elif schedule.status == "align":
+                status_counts["align"] += 1
             if prev_face_index is not None and face_index != prev_face_index:
                 mode_switches += 1
                 if prev_face_index >= 0 and face_index >= 0:

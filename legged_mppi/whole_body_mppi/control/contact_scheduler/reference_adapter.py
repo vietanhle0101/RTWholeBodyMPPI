@@ -57,22 +57,22 @@ def pushing_reference(schedule: ContactSchedule, config: Mapping[str, float], la
     snap-spins. `target_yaw` is still returned unsmoothed for logging, to
     distinguish a deliberate rate-limited turn from a raw scheduler decision.
 
-    A free stage has no contact pose, so its `target_yaw` is inferred from the
-    planned velocity direction, or held at `last_yaw` when that velocity is
-    too small to give a meaningful direction (e.g. the free-mode approach
-    heuristic has just reached its intermediate waypoint) -- defaulting to a
-    fixed 0.0 there instead caused an early version to snap toward "face
-    world +x" whenever planned velocity dipped near zero.
+    A free stage normally infers `target_yaw` from planned velocity, or holds
+    `last_yaw` near zero speed.  Alignment schedules override that inference
+    with their selected face heading, so a stationary robot can turn in place
+    before attempting bumper contact.
     """
     stage = 0
     face_index = int(schedule.face_indices[stage])
     robot_position = np.asarray(schedule.robot_positions[stage + 1], dtype=float)
     robot_velocity = np.asarray(schedule.robot_velocities[stage], dtype=float)
     if face_index < 0:
-        target_yaw = (math.atan2(robot_velocity[1], robot_velocity[0])
+        target_yaw = (float(schedule.desired_yaw) if schedule.desired_yaw is not None else
+                      math.atan2(robot_velocity[1], robot_velocity[0])
                       if np.linalg.norm(robot_velocity) > 1e-5 else last_yaw)
         yaw = _slew_yaw(target_yaw, last_yaw, config)
-        return Go1PushReference(robot_position, yaw, robot_velocity, "free", 0.0, target_yaw)
+        face = "align" if schedule.status == "align" else "free"
+        return Go1PushReference(robot_position, yaw, robot_velocity, face, 0.0, target_yaw)
 
     face = FACE_NAMES[face_index]
     # The planned contact pose is already q_{k+1}; derive heading from the

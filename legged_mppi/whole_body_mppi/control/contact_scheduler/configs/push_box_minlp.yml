@@ -13,8 +13,20 @@ box_yaw_inertia: 0.0849
 linear_damping: 7.0
 angular_damping: 0.25
 
-robot_standoff: 0.34
+# The forward trunk collision bumper reaches approximately 0.276 m ahead of
+# the trunk origin.  The MINLP and staging wrapper therefore share a 0.291 m
+# root-to-face distance: 1.5 cm clearance beyond that physical bumper.
+robot_standoff: 0.291
+bumper_forward_offset: 0.276
+bumper_clearance: 0.015
 robot_speed_max: 0.25
+# Approach/alignment are outside the MINLP, but use the same contact geometry.
+# Re-select a committed pre-contact face only when it becomes counterproductive
+# or another face's goal-direction score wins by this margin.
+approach_face_score_margin: 0.10
+approach_reselect_cooldown_s: 0.60
+align_yaw_tolerance_deg: 12.5
+align_creep_speed: 0.05
 # Contact lifecycle: after engaging a face, remain in contact mode for at
 # least this long. Recover to free approach only after the standoff error has
 # exceeded reachable_distance + margin for this many consecutive replans.

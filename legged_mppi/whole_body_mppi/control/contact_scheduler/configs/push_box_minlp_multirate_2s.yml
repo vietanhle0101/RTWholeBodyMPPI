@@ -23,7 +23,7 @@ box_yaw_inertia: 0.0849
 linear_damping: 7.0
 angular_damping: 0.25
 
-robot_standoff: 0.34
+robot_standoff: 0.291
 robot_speed_max: 0.25
 box_speed_max: 1.0
 box_yaw_rate_max: 2.0

@@ -141,10 +141,11 @@ class Controller:
             now = rospy.get_time()
             if now - last_schedule_time >= scheduler_period:
                 box_yaw = R.from_quat(np.array(self.box_ori)[[1,2,3,0]]).as_euler('xyz')[2]
+                robot_yaw = R.from_quat(np.array(self.body_ori)[[1,2,3,0]]).as_euler('xyz')[2]
                 schedule = scheduler.plan(
                     BoxPlanarState(self.box_pos[0], self.box_pos[1], box_yaw,
                                    self.box_vel[0], self.box_vel[1], self.box_ang_vel[2]),
-                    self.body_xy, mppi.x_box_ref[:2])
+                    self.body_xy, mppi.x_box_ref[:2], robot_yaw=robot_yaw)
                 reference = pushing_reference(schedule, scheduler.config, last_commanded_yaw)
                 last_commanded_yaw = reference.yaw
                 mppi.body_ref[:2] = reference.position

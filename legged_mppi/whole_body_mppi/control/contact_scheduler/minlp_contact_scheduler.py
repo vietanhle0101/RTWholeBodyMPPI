@@ -90,6 +90,25 @@ class MinlpContactScheduler:
         self._contact_release_replans = max(1, int(self.config.get("contact_release_replans", 3)))
         if self._contact_release_margin < 0.0:
             raise ValueError("contact_release_margin must be non-negative")
+        # The planner's planar robot state is the trunk origin, whereas the
+        # desired physical contact is made by the forward bumper.  Keeping
+        # these offsets explicit makes the outer staging policy agree with
+        # the MINLP's root-level `robot_standoff` constraint.
+        self._bumper_forward_offset = float(self.config.get(
+            "bumper_forward_offset", self.config["robot_standoff"]))
+        self._bumper_clearance = float(self.config.get(
+            "bumper_clearance", float(self.config["robot_standoff"]) - self._bumper_forward_offset))
+        if self._bumper_forward_offset < 0.0 or self._bumper_clearance < 0.0:
+            raise ValueError("bumper_forward_offset and bumper_clearance must be non-negative")
+        if not np.isclose(float(self.config["robot_standoff"]),
+                          self._bumper_forward_offset + self._bumper_clearance):
+            raise ValueError("robot_standoff must equal bumper_forward_offset + bumper_clearance")
+        self._align_yaw_tolerance = np.deg2rad(float(self.config.get("align_yaw_tolerance_deg", 12.5)))
+        self._align_creep_speed = float(self.config.get("align_creep_speed", 0.05))
+        self._approach_face_score_margin = float(self.config.get("approach_face_score_margin", 0.10))
+        self._approach_reselect_cooldown_replans = max(
+            0, int(np.ceil(float(self.config.get("approach_reselect_cooldown_s", 0.6)) / self.replan_period)))
+        self._approach_reselect_cooldown = 0
 
     @property
     def diagnostics(self) -> Mapping[str, object]:
@@ -253,9 +272,10 @@ class MinlpContactScheduler:
         switching_offset = self._free_slice_start + blocks
         self._lbx[switching_offset:switching_offset + self.FACE_COUNT * blocks] = 0.0
 
-    def plan(self, box_state: BoxPlanarState, robot_xy: Sequence[float], goal_xy: Sequence[float]) -> ContactSchedule:
+    def plan(self, box_state: BoxPlanarState, robot_xy: Sequence[float], goal_xy: Sequence[float],
+             robot_yaw: Optional[float] = None) -> ContactSchedule:
         """Solve one short-horizon plan from the current measured state."""
-        approach = self._approach_if_needed(box_state, robot_xy, goal_xy)
+        approach = self._approach_if_needed(box_state, robot_xy, goal_xy, robot_yaw)
         if approach is not None:
             return self._finalize_schedule(approach, box_state, robot_xy, goal_xy)
         parameters = np.r_[box_state.vector(), np.asarray(robot_xy, dtype=float), np.asarray(goal_xy, dtype=float),
@@ -423,27 +443,85 @@ class MinlpContactScheduler:
                      force.flatten(order="F"), location.flatten(order="F"), face.flatten(order="F"),
                      free.flatten(order="F"), switching.flatten(order="F")]
 
-    def _select_face(self, box_xy: np.ndarray, yaw: float, robot_xy: np.ndarray, direction: np.ndarray) -> int:
-        """Pick the face whose outward normal best opposes `direction` (the unit
-        box-to-goal vector). A plain argmax always resolves ties (e.g. a goal at
-        exactly 45 degrees, where two faces are equally good) in favor of
-        whichever face is listed first -- "rear" -- regardless of where the
-        robot actually is. Among tied faces, prefer whichever standoff pose the
-        robot can reach first.
-        """
-        rotation = np.array([[np.cos(yaw), -np.sin(yaw)], [np.sin(yaw), np.cos(yaw)]])
+    def _face_geometry(self, face_index: int) -> tuple[np.ndarray, np.ndarray]:
+        """Return a candidate face's box-frame midpoint and outward normal."""
+        midpoints = ((-self.config["box_half_length"], 0.0),
+                     (0.0, self.config["box_half_width"]),
+                     (0.0, -self.config["box_half_width"]))
+        normals = ((-1.0, 0.0), (0.0, 1.0), (0.0, -1.0))
+        return np.asarray(midpoints[face_index], dtype=float), np.asarray(normals[face_index], dtype=float)
+
+    @staticmethod
+    def _rotation(yaw: float) -> np.ndarray:
+        return np.array([[np.cos(yaw), -np.sin(yaw)], [np.sin(yaw), np.cos(yaw)]])
+
+    def _face_scores(self, yaw: float, direction: np.ndarray) -> np.ndarray:
+        """Goal-direction alignment of each face's inward push direction."""
+        rotation = self._rotation(yaw)
         normals = np.array([[-1.0, 0.0], [0.0, 1.0], [0.0, -1.0]])
-        midpoints = np.array(((-self.config["box_half_length"], 0.0),
-                              (0.0, self.config["box_half_width"]),
-                              (0.0, -self.config["box_half_width"])))
-        scores = np.array([np.dot(-(rotation @ normal), direction) for normal in normals])
+        return np.array([np.dot(-(rotation @ normal), direction) for normal in normals])
+
+    def _face_heading(self, box_yaw: float, face_index: int) -> float:
+        """World yaw that points Go1's forward bumper inward through a face."""
+        _, normal = self._face_geometry(face_index)
+        inward = -(self._rotation(box_yaw) @ normal)
+        return float(np.arctan2(inward[1], inward[0]))
+
+    def _standoff_pose(self, box_state: BoxPlanarState, face_index: int) -> tuple[np.ndarray, float]:
+        """Root position/yaw that places the physical forward bumper at a face."""
+        midpoint, normal = self._face_geometry(face_index)
+        box_rotation = self._rotation(box_state.yaw)
+        contact = box_state.vector()[:2] + box_rotation @ midpoint
+        outward = box_rotation @ normal
+        heading = self._face_heading(box_state.yaw, face_index)
+        bumper_world = self._rotation(heading) @ np.array([self._bumper_forward_offset, 0.0])
+        root = contact + self._bumper_clearance * outward - bumper_world
+        return root, heading
+
+    def _select_face(self, box_xy: np.ndarray, yaw: float, robot_xy: np.ndarray, direction: np.ndarray) -> int:
+        """Choose the best goal-aligned face, breaking exact ties by travel distance."""
+        scores = self._face_scores(yaw, direction)
         candidates = np.flatnonzero(scores >= scores.max() - 1e-9)
         if candidates.size == 1:
             return int(candidates[0])
-        standoffs = box_xy + (rotation @ (midpoints[candidates] +
-                              self.config["robot_standoff"] * normals[candidates]).T).T
-        distances = np.linalg.norm(standoffs - robot_xy, axis=1)
+        rotation = self._rotation(yaw)
+        standoffs = []
+        for face_index in candidates:
+            midpoint, normal = self._face_geometry(int(face_index))
+            standoffs.append(box_xy + rotation @ (midpoint + float(self.config["robot_standoff"]) * normal))
+        distances = np.linalg.norm(np.asarray(standoffs) - robot_xy, axis=1)
         return int(candidates[np.argmin(distances)])
+
+    @staticmethod
+    def _angle_error(target: float, current: float) -> float:
+        return float(np.arctan2(np.sin(target - current), np.cos(target - current)))
+
+    def _commit_approach_face(self, face_index: int) -> None:
+        """Start staging a new face and discard a trajectory tied to the old one."""
+        if face_index == self._committed_face_index:
+            return
+        self._committed_face_index = face_index
+        self._last_solution = None
+        self._previous_face_index = -1
+        self._approach_reselect_cooldown = self._approach_reselect_cooldown_replans
+
+    def _motion_schedule(self, box_state: BoxPlanarState, robot_xy: np.ndarray, target_xy: np.ndarray,
+                         speed: float, status: str, desired_yaw: Optional[float] = None) -> ContactSchedule:
+        """Build a kinematically consistent, force-free staging schedule."""
+        robot = np.zeros((self.horizon + 1, 2))
+        velocity = np.zeros((self.horizon, 2))
+        robot[0] = robot_xy
+        for k in range(self.horizon):
+            delta = target_xy - robot[k]
+            distance = np.linalg.norm(delta)
+            step = (np.zeros(2) if distance < 1e-9 else
+                    delta / distance * min(distance, speed * self.dt))
+            robot[k + 1] = robot[k] + step
+            velocity[k] = step / self.dt
+        box = np.tile(box_state.vector(), (self.horizon + 1, 1))
+        return ContactSchedule(box, robot, velocity, np.zeros((self.horizon, self.FACE_COUNT)),
+                               np.zeros((self.horizon, self.FACE_COUNT)), -np.ones(self.horizon, dtype=int),
+                               True, status, desired_yaw)
 
     def _initial_guess(self, box_state: BoxPlanarState, robot_xy: Sequence[float]) -> np.ndarray:
         """Provide BONMIN with a feasible all-free trajectory warm start."""
@@ -464,28 +542,30 @@ class MinlpContactScheduler:
         switching = np.zeros(self.FACE_COUNT * blocks)
         return np.r_[box, robot, velocity, force, location, faces, free, switching]
 
-    def _approach_if_needed(self, box_state: BoxPlanarState, robot_xy: Sequence[float], goal_xy: Sequence[float]) -> Optional[ContactSchedule]:
-        """Return free approach only before contact or after sustained loss."""
+    def _approach_if_needed(self, box_state: BoxPlanarState, robot_xy: Sequence[float],
+                            goal_xy: Sequence[float], robot_yaw: Optional[float] = None) -> Optional[ContactSchedule]:
+        """Stage a goal-aligned bumper contact before allowing a push solve.
+
+        This wrapper owns only approach/alignment.  It never geometrically
+        reselects a face while in ``hold``: changing an established physical
+        push is the separate measured-progress reassessment problem.
+        """
         robot_xy = np.asarray(robot_xy, dtype=float)
         goal_xy = np.asarray(goal_xy, dtype=float)
         direction = goal_xy - box_state.vector()[:2]
         if np.linalg.norm(direction) < 1e-6:
             return None
         direction /= np.linalg.norm(direction)
-        # Keep one approach face while repositioning. Re-selecting it from
-        # scratch each replan can make a near-tie look like mode flicker.
-        yaw = box_state.yaw
-        rotation = np.array([[np.cos(yaw), -np.sin(yaw)], [np.sin(yaw), np.cos(yaw)]])
-        normals = np.array([[-1.0, 0.0], [0.0, 1.0], [0.0, -1.0]])
-        face_index = (self._committed_face_index if self._committed_face_index >= 0
-                      else self._select_face(box_state.vector()[:2], yaw, robot_xy, direction))
-        midpoint = ((-self.config["box_half_length"], 0.0), (0.0, self.config["box_half_width"]),
-                    (0.0, -self.config["box_half_width"]))[face_index]
-        contact_pose = box_state.vector()[:2] + rotation @ (np.asarray(midpoint) + self.config["robot_standoff"] * normals[face_index])
         reachable_distance = self.horizon * self.dt * self.config["robot_speed_max"]
-        self._last_standoff_error = float(np.linalg.norm(contact_pose - robot_xy))
 
+        # Hold only suppresses this outer staging heuristic.  If contact has
+        # been lost for long enough, fully clear the old face so fresh
+        # geometry—not the stale commitment—selects the next approach.
         if self._phase == "hold":
+            held_face = (self._committed_face_index if self._committed_face_index >= 0 else
+                         self._select_face(box_state.vector()[:2], box_state.yaw, robot_xy, direction))
+            held_target, _ = self._standoff_pose(box_state, held_face)
+            self._last_standoff_error = float(np.linalg.norm(held_target - robot_xy))
             release_distance = reachable_distance + self._contact_release_margin
             if (self._contact_hold_replans >= self._min_contact_hold_replans
                     and self._last_standoff_error > release_distance):
@@ -493,28 +573,51 @@ class MinlpContactScheduler:
             else:
                 self._release_violations = 0
             if self._release_violations < self._contact_release_replans:
-                # Invoke the MINLP; _finalize_schedule prevents a one-cycle
-                # free result from cancelling a sustained physical push.
                 return None
             self._phase = "approach"
+            self._committed_face_index = -1
+            self._previous_face_index = -1
             self._contact_hold_replans = 0
             self._release_violations = 0
             self._last_solution = None
 
-        if np.linalg.norm(contact_pose - robot_xy) <= reachable_distance:
-            return None
-        self._committed_face_index = face_index
-        h = self.horizon
-        delta = contact_pose - robot_xy
-        velocity = delta / max(np.linalg.norm(delta), 1e-9) * self.config["robot_speed_max"]
-        robot = np.zeros((h + 1, 2)); robot[0] = robot_xy
-        for k in range(h):
-            remaining = contact_pose - robot[k]
-            step = velocity * self.dt if np.linalg.norm(remaining) > np.linalg.norm(velocity * self.dt) else remaining
-            robot[k + 1] = robot[k] + step
-        box = np.tile(box_state.vector(), (h + 1, 1))
-        return ContactSchedule(box, robot, np.tile(velocity, (h, 1)), np.zeros((h, self.FACE_COUNT)),
-                               np.zeros((h, self.FACE_COUNT)), -np.ones(h, dtype=int), True, "free-mode approach")
+        # Revalidate a pre-contact commitment on every replan.  This avoids a
+        # reachable but now counterproductive face trapping the robot after
+        # box drift or yaw.  Exact/near ties stay committed to avoid chatter.
+        scores = self._face_scores(box_state.yaw, direction)
+        candidate = self._select_face(box_state.vector()[:2], box_state.yaw, robot_xy, direction)
+        committed = self._committed_face_index
+        if committed < 0:
+            self._commit_approach_face(candidate)
+        else:
+            if self._approach_reselect_cooldown > 0:
+                self._approach_reselect_cooldown -= 1
+            current_score = scores[committed]
+            candidate_score = scores[candidate]
+            should_reselect = (current_score < 0.0 or
+                               (candidate != committed and self._approach_reselect_cooldown == 0 and
+                                candidate_score > current_score + self._approach_face_score_margin))
+            if should_reselect:
+                self._phase = "approach"
+                self._commit_approach_face(candidate)
+
+        face_index = self._committed_face_index
+        target_xy, target_yaw = self._standoff_pose(box_state, face_index)
+        self._last_standoff_error = float(np.linalg.norm(target_xy - robot_xy))
+        if self._last_standoff_error > reachable_distance:
+            self._phase = "approach"
+            return self._motion_schedule(box_state, robot_xy, target_xy,
+                                         float(self.config["robot_speed_max"]), "free-mode approach")
+
+        # MPPI's yaw command is slew-limited downstream.  Creep rather than
+        # engage while it turns, so the trunk bumper—not a swinging front
+        # leg—reaches the box first.  Omitting robot_yaw retains the legacy
+        # API behavior for non-MuJoCo callers.
+        if robot_yaw is not None and abs(self._angle_error(target_yaw, float(robot_yaw))) > self._align_yaw_tolerance:
+            self._phase = "align"
+            return self._motion_schedule(box_state, robot_xy, target_xy,
+                                         self._align_creep_speed, "align", target_yaw)
+        return None
 
     def _unpack(self, values: np.ndarray, success: bool, status: str) -> ContactSchedule:
         blocks, block_size = self.horizon, self.block_size

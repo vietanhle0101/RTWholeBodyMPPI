@@ -1,7 +1,7 @@
 """Solver-independent data exchanged by high-level contact schedulers."""
 
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 
@@ -48,6 +48,10 @@ class ContactSchedule:
     face_indices: np.ndarray
     success: bool
     status: str
+    # Free/approach schedules normally infer yaw from their translational
+    # velocity.  Alignment is different: it may intentionally hold position
+    # while asking the torso to turn toward a selected box face.
+    desired_yaw: Optional[float] = None
 
     @property
     def active_faces(self) -> Tuple[int, ...]:
