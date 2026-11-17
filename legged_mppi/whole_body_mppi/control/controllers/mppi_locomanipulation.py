@@ -17,6 +17,7 @@ GAIT_DIR = os.path.join(BASE_DIR, "../gait_scheduler/gaits/")
 GAIT_INPLACE_PATH = os.path.join(GAIT_DIR, "FAST/walking_gait_raibert_FAST_0_0_10cm_100hz.tsv")
 GAIT_TROT_PATH = os.path.join(GAIT_DIR, "MED/walking_gait_raibert_MED_0_5_15cm_100hz.tsv")
 GAIT_WALK_PATH = os.path.join(GAIT_DIR, "MED/walking_gait_raibert_MED_0_1_10cm_100hz.tsv")
+GAIT_WALK_02_PATH = os.path.join(GAIT_DIR, "MED/walking_gait_raibert_MED_0_2_10cm_100hz.tsv")
 
 class MPPI_box_push(BaseMPPI):
     """
@@ -76,7 +77,8 @@ class MPPI_box_push(BaseMPPI):
         self.gaits = {
             'in_place': GaitScheduler(gait_path=GAIT_INPLACE_PATH, name='in_place'),
             'trot': GaitScheduler(gait_path=GAIT_TROT_PATH, name='trot'),
-            'walk': GaitScheduler(gait_path=GAIT_WALK_PATH, name='walk')
+            'walk': GaitScheduler(gait_path=GAIT_WALK_PATH, name='walk'),
+            'walk_0.2': GaitScheduler(gait_path=GAIT_WALK_02_PATH, name='walk_0.2'),  # used with ref_traj
         }
 
         self.gait_scheduler = self.gaits['in_place']
@@ -91,8 +93,9 @@ class MPPI_box_push(BaseMPPI):
         
         self.gait_scheduler = self.gaits[self.desired_gait[self.goal_index]]
         self.task_success = False
-        self.box_state = np.zeros(13) 
-        self.robot_state = np.zeros(37) 
+        self.box_state = np.zeros(13)
+        self.robot_state = np.zeros(37)
+        self.ref_traj = None  # optional (horizon, 13) body reference from a global planner
 
         # Debug information
         print(f"Initial goal {self.goal_index}: {self.goal_pos[self.goal_index] }")
@@ -150,12 +153,15 @@ class MPPI_box_push(BaseMPPI):
         goal_delta = np.linalg.norm(direction)
 
         # Update desired orientation based on the goal position
-        if (goal_delta > 0.1) and ((self.gait_scheduler == self.gaits['walk']) or (self.gait_scheduler == self.gaits['trot'])): 
+        if self.ref_traj is not None:
+            pass  # heading comes with the external reference
+        elif (goal_delta > 0.1) and ((self.gait_scheduler == self.gaits['walk']) or (self.gait_scheduler == self.gaits['trot'])):
             self.goal_ori = calculate_orientation_quaternion(self.robot_state[:3], self.body_ref[:3])
         elif self.gait_scheduler == self.gaits['in_place']:
             self.goal_ori = np.array([1,0,0,0])
 
-        self.body_ref[3:7] = self.goal_ori
+        if self.ref_traj is None:
+            self.body_ref[3:7] = self.goal_ori
         self.rollout_func(self.state_rollouts, actions, np.repeat(np.array([np.concatenate([[0],self.obs])]), self.n_samples, axis=0), num_workers=self.num_workers, nstep=self.horizon)
         
         if self.internal_ref:
@@ -163,8 +169,9 @@ class MPPI_box_push(BaseMPPI):
         
         costs_sum = self.cost_func(self.state_rollouts[:,:,np.r_[8:27, 33:51]],\
                                    self.state_rollouts[:,:,np.r_[1:8, 27:33]],\
-                                   actions, 
-                                   self.joints_ref, self.body_ref)
+                                   actions,
+                                   self.joints_ref,
+                                   self.body_ref if self.ref_traj is None else self.ref_traj)
 
         # Update the gait scheduler
         self.gait_scheduler.roll()
@@ -231,10 +238,14 @@ class MPPI_box_push(BaseMPPI):
         return robot_cost + box_cost
 
     def calculate_total_cost(self, robot_state, box_state, actions, joints_ref, body_ref):
+        """body_ref is either one (13,) reference for the whole horizon or a (horizon, 13) trajectory."""
         num_samples = robot_state.shape[0]
         num_pairs = robot_state.shape[1]
 
-        traj_body_ref = np.repeat(body_ref[np.newaxis,:], num_samples*num_pairs, axis=0)
+        if body_ref.ndim == 1:
+            traj_body_ref = np.repeat(body_ref[np.newaxis,:], num_samples*num_pairs, axis=0)
+        else:
+            traj_body_ref = np.tile(body_ref, (num_samples, 1))  # rows ordered (sample, step) like the states
 
         # Flatten robot_state and actions to two dimensions, treating all pairs per sample as a batch
         robot_state = robot_state.reshape(-1, robot_state.shape[2])

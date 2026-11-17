@@ -4,3 +4,5 @@ numpy
 mujoco-python-viewer==0.1.4
 matplotlib
 tqdm==4.66.5
+pyyaml
+pillow

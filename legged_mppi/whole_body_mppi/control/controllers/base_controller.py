@@ -1,3 +1,4 @@
+import inspect
 import numpy as np
 import concurrent.futures
 import threading
@@ -6,6 +7,8 @@ import mujoco
 from scipy.interpolate import CubicSpline
 from mujoco import rollout
 import yaml
+
+OLD_ROLLOUT_API = "nroll" in inspect.signature(rollout.rollout).parameters  # mujoco < 3.2
 
 class BaseMPPI:
     """
@@ -128,9 +131,16 @@ class BaseMPPI:
             ctrl (np.ndarray): Control actions to apply during the rollout.
             state (np.ndarray): State array to store the results of the rollout.
         """
-        rollout.rollout(self.model, self.thread_local.data, skip_checks=True,
-                        nroll=state.shape[0], nstep=state.shape[1],
-                        initial_state=initial_state, control=ctrl, state=state)
+        nroll, nstep = state.shape[:2]
+        if OLD_ROLLOUT_API:
+            rollout.rollout(self.model, self.thread_local.data, skip_checks=True,
+                            nroll=nroll, nstep=nstep,
+                            initial_state=initial_state, control=ctrl, state=state)
+        else:
+            # mujoco >= 3.2 with skip_checks wants one model per rollout and a list of datas;
+            # a single data runs on the calling thread, like before
+            rollout.rollout([self.model] * nroll, [self.thread_local.data], initial_state, ctrl,
+                            skip_checks=True, nstep=nstep, state=state)
 
     def threaded_rollout(self, state, ctrl, initial_state, num_workers=32, nstep=5):
         """
