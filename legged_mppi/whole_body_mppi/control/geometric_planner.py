@@ -3,7 +3,8 @@
 Push direction d points from the box to the goal. If the trunk is behind the box on that line it walks
 through the box towards E = goal - contact * d (where its center ends when the box sits on the goal).
 Otherwise it first walks to a standoff point behind the box, going around the box if needed.
-Returns a time-indexed plan (t, P, V) for BodyReference.set_plan.
+plan(t, qpos, qvel) takes the Go1 scene state (qpos = [box 7, robot 19]) and returns a time-indexed
+plan (t, P, V) for BodyReference.set_plan.
 """
 import numpy as np
 
@@ -43,8 +44,8 @@ class GeometricPushPlanner:
         self.align_tol, self.keep_tol, self.done_tol = align_tol, keep_tol, done_tol
         self.mode = "approach"
 
-    def plan(self, t, trunk_xy, box_xy):
-        p, b, g = np.asarray(trunk_xy, float), np.asarray(box_xy, float), self.goal
+    def plan(self, t, qpos, qvel=None):
+        p, b, g = np.asarray(qpos[7:9], float), np.asarray(qpos[0:2], float), self.goal
         if np.linalg.norm(g - b) < self.done_tol:
             self.mode = "done"
             return polyline(t, [p], [])

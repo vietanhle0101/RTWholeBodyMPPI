@@ -2,9 +2,12 @@
 
     .venv-ksos/bin/python legged_mppi/scripts/run_push.py --planner geometric --seeds 0-9
     .venv-ksos/bin/python legged_mppi/scripts/run_push.py --planner geometric --seeds 0 --view
+    .venv-ksos/bin/python legged_mppi/scripts/run_push.py --planner ksos --replan 0.5 --seeds 0-4
 
-Every --replan s the planner gets the current trunk and box xy and returns a time-indexed trunk plan;
+Every --replan s the planner gets the current state and returns a time-indexed trunk plan;
 BodyReference turns it into MPPI's per-step reference and picks the gait from the planned speed.
+KSOS (on the reduced trunk model, GPU) also gives the heading; its seeds run one after another in one
+process, so the planner is compiled once.
 Logs to logs/run_push/<time>_<planner>_goal<x>_<y>/ with a plot.
 """
 import argparse
@@ -21,10 +24,20 @@ DT = 0.01
 SCENE = "models/go1/go1_scene_mppi_pyr_push_box_14in.xml"
 
 
-def make_planner(args):
+_KSOS = None
+
+
+def make_planner(args, seed):
+    global _KSOS
     if args.planner == "geometric":
         from whole_body_mppi.control.geometric_planner import GeometricPushPlanner
         return GeometricPushPlanner(args.goal)
+    if args.planner == "ksos":
+        if _KSOS is None:
+            from whole_body_mppi.ksos.planner import KSOSPushPlanner
+            _KSOS = KSOSPushPlanner(args.goal, passes=args.passes)
+        _KSOS.reset(seed)
+        return _KSOS
     raise ValueError(args.planner)
 
 
@@ -46,15 +59,15 @@ def run(seed, args, out_dir):
     mujoco.mj_forward(model, data)
     box0 = data.qpos[:2].copy()
 
-    planner = make_planner(args)
+    planner = make_planner(args, seed)
     ref = BodyReference(yaw0=0.0)
     ref.set_plan(*polyline(0.0, [data.qpos[7:9].copy()], []))  # stand still until the first replan
     next_replan = args.hold
 
     viewer = None
-    if args.view:
-        import mujoco_viewer
-        viewer = mujoco_viewer.MujocoViewer(model, data, hide_menus=True)
+    if args.view:  # MuJoCo's own viewer: mujoco_viewer 0.1.4 can crash drawing markers on MuJoCo 3.16
+        from mujoco import viewer as mj_viewer
+        viewer = mj_viewer.launch_passive(model, data, show_left_ui=False, show_right_ui=False)
         viewer.cam.distance, viewer.cam.elevation = 3.5, -35
         viewer.cam.lookat[:] = [1.0, 0.0, 0.2]
 
@@ -62,7 +75,7 @@ def run(seed, args, out_dir):
     t_goal, t_done = np.nan, None
     for k in range(int(args.time / DT)):
         if data.time >= next_replan - 1e-9:
-            ref.set_plan(*planner.plan(data.time, data.qpos[7:9].copy(), data.qpos[:2].copy()))
+            ref.set_plan(*planner.plan(data.time, data.qpos.copy(), data.qvel.copy()))
             next_replan += args.replan
         ctrl.ref_traj = ref.horizon(data.time)
         ctrl.gait_scheduler = ctrl.gaits[ref.gait(data.time)]
@@ -79,15 +92,19 @@ def run(seed, args, out_dir):
             break
 
         if viewer is not None:
-            if not viewer.is_alive:
+            if not viewer.is_running():
                 break
-            if k % 2 == 0:
-                for pos, rgba in ((ctrl.ref_traj[0, :3], [1, 0, 1, 1]), (np.r_[goal, 0.2], [1, 1, 0, 1])):
-                    viewer.add_marker(pos=pos * 1, size=[0.06] * 3, rgba=rgba,
-                                      type=mujoco.mjtGeom.mjGEOM_SPHERE, label=planner.mode if pos is not None else "")
-                viewer.render()
+            if k % 2 == 0:  # pink: trunk reference now, yellow: goal
+                with viewer.lock():
+                    scn = viewer.user_scn
+                    scn.ngeom = 0
+                    for pos, rgba in ((ctrl.ref_traj[0, :3], [1, 0, 1, 1]), (np.r_[goal, 0.2], [1, 1, 0, 1])):
+                        mujoco.mjv_initGeom(scn.geoms[scn.ngeom], mujoco.mjtGeom.mjGEOM_SPHERE, np.array([0.06, 0, 0]),
+                                            np.asarray(pos, float), np.eye(3).ravel(), np.array(rgba, np.float32))
+                        scn.ngeom += 1
+                viewer.sync()
     ctrl.shutdown()
-    if viewer is not None and viewer.is_alive:
+    if viewer is not None:
         viewer.close()
 
     box, trunk, refs = np.array(box), np.array(trunk), np.array(refs)
@@ -97,11 +114,15 @@ def run(seed, args, out_dir):
     d = (goal - box0) / np.linalg.norm(goal - box0)
     report(seed, box, trunk, refs, goal, box0, d, t_goal)
     print(f"   seed {seed}: mode switches {switches}, finished {'%.1f s' % t_done if t_done else 'no'}", flush=True)
+    if getattr(planner, "solve_times", None):
+        st = planner.solve_times[1:] or planner.solve_times  # the first solve includes jit
+        print(f"   seed {seed}: {len(planner.solve_times)} replans, solve median {np.median(st):.1f} s", flush=True)
 
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--planner", default="geometric", choices=["geometric"])
+    p.add_argument("--planner", default="geometric", choices=["geometric", "ksos"])
+    p.add_argument("--passes", type=int, default=3, help="KSOS passes per replan")
     p.add_argument("--goal", type=float, nargs=2, default=[2.0, -0.75])
     p.add_argument("--replan", type=float, default=0.2, help="replanning period [s]")
     p.add_argument("--hold", type=float, default=1.0, help="stand still before the first plan [s]")
@@ -119,6 +140,9 @@ if __name__ == "__main__":
     seeds = seed_list(args.seeds)
     if args.view:
         run(seeds[0], args, out)
+    elif args.planner == "ksos":  # one GPU planner, seeds in sequence
+        for s in seeds:
+            run(s, args, out)
     else:
         with Pool(args.jobs) as pool:
             pool.starmap(run, [(s, args, out) for s in seeds])

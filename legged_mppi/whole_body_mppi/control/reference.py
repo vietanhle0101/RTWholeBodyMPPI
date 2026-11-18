@@ -1,8 +1,9 @@
 """Turn a planned trunk path p(t), v(t) (world xy) into the per-step body reference MPPI_box_push uses.
 
 Row layout matches body_ref: [x, y, z, qw, qx, qy, qz, vx_body, vy_body, vz, wx, wy, wz].
-Heading follows the planned velocity, is held while the plan is (nearly) still, and is rate limited
-so a sharp turn in the plan does not ask the trunk for a yaw jump.
+Heading comes from the plan when it gives one (e.g. KSOS on the trunk model), otherwise it follows the
+planned velocity and is held while the plan is (nearly) still. Either way it is rate limited, so a
+sharp turn or a replan does not ask the trunk for a yaw jump.
 """
 import numpy as np
 
@@ -16,9 +17,10 @@ class BodyReference:
         self.z, self.v_min, self.yaw_rate = z, v_min, yaw_rate
         self.yaw, self.t_last = yaw0, None
 
-    def set_plan(self, t, P, V):
-        """t: (N,) times, P: (N, 2) positions, V: (N, 2) velocities, all world frame."""
+    def set_plan(self, t, P, V, Y=None):
+        """t: (N,) times, P: (N, 2) positions, V: (N, 2) velocities, Y: (N,) optional yaw, world frame."""
         self.t, self.P, self.V = np.asarray(t), np.asarray(P), np.asarray(V)
+        self.Y = None if Y is None else np.unwrap(np.asarray(Y))
 
     def sample(self, tq):
         tq = np.clip(tq, self.t[0], self.t[-1])  # hold the ends of the plan
@@ -33,10 +35,12 @@ class BodyReference:
         yaw = np.empty(H)
         y = self.yaw
         step0 = dt if self.t_last is None else max(t0 - self.t_last, 0.0)
+        target = None if self.Y is None else np.interp(np.clip(tq, self.t[0], self.t[-1]), self.t, self.Y)
         for k in range(H):
-            if np.linalg.norm(v[k]) > self.v_min:
+            if target is not None or np.linalg.norm(v[k]) > self.v_min:
+                goal = target[k] if target is not None else np.arctan2(v[k, 1], v[k, 0])
                 max_step = self.yaw_rate * (step0 if k == 0 else dt)
-                y += np.clip(wrap(np.arctan2(v[k, 1], v[k, 0]) - y), -max_step, max_step)
+                y += np.clip(wrap(goal - y), -max_step, max_step)
             yaw[k] = y
         self.yaw, self.t_last = yaw[0], t0  # commit only the current step
 

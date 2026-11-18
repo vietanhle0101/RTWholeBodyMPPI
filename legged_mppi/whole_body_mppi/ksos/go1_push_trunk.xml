@@ -1,0 +1,62 @@
+<!-- Reduced model of the Go1 box push for the global planner: a planar trunk with heading.
+     Trunk: flat-nosed box on x/y slides + yaw hinge. Nose 0.28 m ahead of the trunk center =
+     measured trunk-center-to-box-center distance while pushing (0.47 m) minus the box half width.
+     Controls all in [-1, 1], so uniform KSOS sampling and the isotropic MPPI/LSE noise fit every one:
+       forward: body-frame forward speed = 0.1 + 0.1 * ctrl, ctrl in [-1, 1] -> 0..0.2 m/s
+                (general actuator: force = 600 * (0.1 + 0.1 * ctrl - v_forward))
+       lateral: no command (gain 0), only a damper force = -600 * v_lateral: the Go1 gaits do not walk
+                sideways. The task pins its ctrl range to 0 so the planner does not sample it.
+       turn:    yaw rate, ctrl in [-1, 1] rad/s (Go1 tracked 1 rad/s)
+     Box, floor friction and contact settings follow go1_scene_mppi_pyr_push_box_14in.xml:
+     box-floor mu = max(0.8, 0) = 0.8, trunk-box mu = max(0.6, 0) = 0.6.
+     Collision bits: the trunk (2) only touches the box (3), never the floor (1).
+     Solver: impratio 100 keeps stiction (impratio 1 creeps), 20 ms steps, 50 iterations (fewer can
+     diverge in MJX), 10 line-search iterations (same result as 50, 4x faster); see ksos_check_mjx.py. -->
+<mujoco model="go1_push_trunk">
+  <option timestep="0.02" cone="pyramidal" impratio="100" iterations="50" ls_iterations="10"/>
+
+  <default>
+    <geom solref="0.02 1" solimp="0.9 0.95 0.001 0.5 2"/>
+  </default>
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0"/>
+  </visual>
+
+  <worldbody>
+    <light pos="1 0 3" dir="0 0 -1" directional="true"/>
+    <geom name="floor" type="plane" size="0 0 0.1" rgba="0.3 0.35 0.4 1" friction="0.8 0.005 0.0001"
+          contype="1" conaffinity="1"/>
+    <camera name="top" pos="1.2 -0.3 4.0" xyaxes="1 0 0 0 1 0"/>
+
+    <body name="goal" mocap="true" pos="2 -0.75 0.005">
+      <geom type="box" size="0.19 0.19 0.005" rgba="0 1 0 0.3" contype="0" conaffinity="0"/>
+    </body>
+
+    <body name="box" pos="1 0 0.19">
+      <freejoint name="box"/>
+      <geom name="box" type="box" size="0.19 0.19 0.19" rgba="0.2 0.8 0.2 1" friction="0 0.005 0.0001"
+            contype="3" conaffinity="3"/>
+      <inertial pos="0 0 0" mass="3.7" diaginertia="0.0749 0.0749 0.0849"/>
+    </body>
+
+    <body name="trunk" pos="0 0 0.19">
+      <joint name="trunk_x" type="slide" axis="1 0 0"/>
+      <joint name="trunk_y" type="slide" axis="0 1 0"/>
+      <joint name="trunk_yaw" type="hinge" axis="0 0 1"/>
+      <geom name="trunk" type="box" size="0.28 0.15 0.1" rgba="0.9 0.3 0.3 0.7" friction="0.6 0.005 0.0001"
+            contype="2" conaffinity="2"/>
+      <geom name="nose" type="box" size="0.02 0.05 0.03" pos="0.28 0 0.12" rgba="1 1 1 1" contype="0" conaffinity="0"/>
+      <inertial pos="0 0 0" mass="12.7" diaginertia="0.1 0.3 0.3"/>
+      <site name="trunk" pos="0 0 0"/>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <general name="forward" site="trunk" gear="1 0 0 0 0 0" ctrllimited="true" ctrlrange="-1 1"
+             gainprm="60" biastype="affine" biasprm="60 0 -600" forcelimited="true" forcerange="-80 80"/>
+    <general name="lateral" site="trunk" gear="0 1 0 0 0 0" ctrllimited="true" ctrlrange="-1 1"
+             gainprm="0" biastype="affine" biasprm="0 0 -600" forcelimited="true" forcerange="-150 150"/>
+    <velocity name="turn" joint="trunk_yaw" kv="30" ctrlrange="-1 1" forcelimited="true" forcerange="-20 20"/>
+  </actuator>
+</mujoco>
