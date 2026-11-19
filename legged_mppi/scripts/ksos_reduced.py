@@ -137,7 +137,12 @@ if __name__ == "__main__":
     p.add_argument("--replan", type=float, default=0.5, help="replanning period [s]")
     p.add_argument("--tol", type=float, default=0.3, help="success radius [m]")
     p.add_argument("--done-tol", type=float, default=0.1, help="stop when the box is this close [m]")
-    p.add_argument("--passes", type=int, default=3, help="KSOS passes per replan")
+    p.add_argument("--passes", type=int, default=1, help="KSOS passes per replan")
+    p.add_argument("--flow", help="trained first-pass sampler (ksos_train_flow.py output dir)")
+    p.add_argument("--lse-sigma", type=float, default=0.1, help="first-pass LSE smoothing noise")
+    p.add_argument("--mppi-noise", type=float, default=0.3, help="first-pass MPPI sampling noise")
+    p.add_argument("--ksos-samples", type=int, default=64, help="KSOS candidates per pass")
+    p.add_argument("--impl", default="jax", choices=["jax", "warp"], help="MJX backend of the planner rollouts")
     p.add_argument("--seeds", default="0-4")
     p.add_argument("--view", action="store_true", help="live viewer; runs only the first seed")
     p.add_argument("--replay", help="play a logged seed*.npz in the viewer instead of running")
@@ -150,7 +155,9 @@ if __name__ == "__main__":
     from whole_body_mppi.ksos.planner import KSOSPlanner
     from whole_body_mppi.ksos.task import Go1PushTask
 
-    planner = KSOSPlanner(Go1PushTask(), passes=args.passes)
+    planner = KSOSPlanner(Go1PushTask(), passes=args.passes, flow=args.flow, lse_sigma=args.lse_sigma,
+                          mppi_noise=args.mppi_noise, ksos_samples=args.ksos_samples,
+                          impl=args.impl)
     out = os.path.join("logs", "ksos_reduced", f"{datetime.now():%Y%m%d_%H%M%S}_goal{args.goal[0]:g}_{args.goal[1]:g}")
     os.makedirs(out)
     print("logging to", out)

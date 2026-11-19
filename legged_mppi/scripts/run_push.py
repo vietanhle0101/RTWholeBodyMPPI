@@ -3,12 +3,13 @@
     .venv-ksos/bin/python legged_mppi/scripts/run_push.py --planner geometric --seeds 0-9
     .venv-ksos/bin/python legged_mppi/scripts/run_push.py --planner geometric --seeds 0 --view
     .venv-ksos/bin/python legged_mppi/scripts/run_push.py --planner ksos --replan 0.5 --seeds 0-4
+    .venv-ksos/bin/python legged_mppi/scripts/run_push.py --planner ksos --flow logs/ksos_flow/plain --passes 1
 
 Every --replan s the planner gets the current state and returns a time-indexed trunk plan;
 BodyReference turns it into MPPI's per-step reference and picks the gait from the planned speed.
 KSOS (on the reduced trunk model, GPU) also gives the heading; its seeds run one after another in one
 process, so the planner is compiled once.
-Logs to logs/run_push/<time>_<planner>_goal<x>_<y>/ with a plot.
+Logs to logs/run_push/<time>_<planner>_goal<x>_<y>/ with a plot; render_push.py makes a video of a seed.
 """
 import argparse
 import os
@@ -35,7 +36,9 @@ def make_planner(args, seed):
     if args.planner == "ksos":
         if _KSOS is None:
             from whole_body_mppi.ksos.planner import KSOSPushPlanner
-            _KSOS = KSOSPushPlanner(args.goal, passes=args.passes)
+            _KSOS = KSOSPushPlanner(args.goal, passes=args.passes, flow=args.flow, lse_sigma=args.lse_sigma,
+                                    mppi_noise=args.mppi_noise, ksos_samples=args.ksos_samples,
+                                    impl=args.impl)
         _KSOS.reset(seed)
         return _KSOS
     raise ValueError(args.planner)
@@ -71,7 +74,7 @@ def run(seed, args, out_dir):
         viewer.cam.distance, viewer.cam.elevation = 3.5, -35
         viewer.cam.lookat[:] = [1.0, 0.0, 0.2]
 
-    box, trunk, refs, modes = [], [], [], []
+    box, trunk, refs, modes, qpos = [], [], [], [], []
     t_goal, t_done = np.nan, None
     for k in range(int(args.time / DT)):
         if data.time >= next_replan - 1e-9:
@@ -82,7 +85,7 @@ def run(seed, args, out_dir):
         data.ctrl[:] = ctrl.update(np.r_[data.qpos, data.qvel])
         mujoco.mj_step(model, data)
 
-        box.append(data.qpos[:7].copy()); trunk.append(data.qpos[7:14].copy())
+        box.append(data.qpos[:7].copy()); trunk.append(data.qpos[7:14].copy()); qpos.append(data.qpos.copy())
         refs.append(ctrl.ref_traj[0, :3].copy()); modes.append(planner.mode)
         if np.isnan(t_goal) and np.linalg.norm(data.qpos[:2] - goal) < args.tol:
             t_goal = data.time
@@ -110,7 +113,7 @@ def run(seed, args, out_dir):
     box, trunk, refs = np.array(box), np.array(trunk), np.array(refs)
     switches = sum(a != b for a, b in zip(modes[:-1], modes[1:]))
     np.savez(os.path.join(out_dir, f"seed{seed}.npz"), box=box, trunk=trunk, ref=refs, plan_P=refs[:, :2],
-             goal=goal, t_goal=t_goal, modes=np.array(modes))
+             qpos=np.array(qpos), goal=goal, t_goal=t_goal, modes=np.array(modes))
     d = (goal - box0) / np.linalg.norm(goal - box0)
     report(seed, box, trunk, refs, goal, box0, d, t_goal)
     print(f"   seed {seed}: mode switches {switches}, finished {'%.1f s' % t_done if t_done else 'no'}", flush=True)
@@ -122,7 +125,12 @@ def run(seed, args, out_dir):
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--planner", default="geometric", choices=["geometric", "ksos"])
-    p.add_argument("--passes", type=int, default=3, help="KSOS passes per replan")
+    p.add_argument("--passes", type=int, default=1, help="KSOS passes per replan")
+    p.add_argument("--flow", help="trained first-pass sampler (ksos_train_flow.py output dir)")
+    p.add_argument("--lse-sigma", type=float, default=0.1, help="first-pass LSE smoothing noise")
+    p.add_argument("--mppi-noise", type=float, default=0.3, help="first-pass MPPI sampling noise")
+    p.add_argument("--ksos-samples", type=int, default=64, help="KSOS candidates per pass")
+    p.add_argument("--impl", default="jax", choices=["jax", "warp"], help="MJX backend of the planner rollouts")
     p.add_argument("--goal", type=float, nargs=2, default=[2.0, -0.75])
     p.add_argument("--replan", type=float, default=0.2, help="replanning period [s]")
     p.add_argument("--hold", type=float, default=1.0, help="stand still before the first plan [s]")

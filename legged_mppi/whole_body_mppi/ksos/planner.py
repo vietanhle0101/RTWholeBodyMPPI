@@ -1,9 +1,9 @@
 """KSOS + MPPI (Global-MPPI) on the reduced trunk push model.
 
 One `solve` is one control cycle of global_mppi.simulation.deterministic.run_interactive, without the
-logging: for each pass, roll out uniform KSOS candidates (LSE-smoothed), fit the kernel bandwidth,
-solve KSOS, then refine with the safeguarded MPPI step. The plan is a cubic spline of controls,
-knots at absolute times `tk`.
+logging: for each pass, roll out KSOS candidates (LSE-smoothed; uniform, or from a trained flow in the
+first pass), fit the kernel bandwidth, solve KSOS, then refine with one MPPI rollout pass (best sample,
+see refine). The plan is a cubic spline of controls, knots at absolute times `tk`.
 """
 import time
 
@@ -19,18 +19,36 @@ from scipy.optimize import minimize
 
 class KSOSPlanner:
     def __init__(self, task, horizon=4.0, num_knots=8, ksos_samples=64, lse_samples=16, mppi_samples=256,
-                 passes=3, seed=0):
+                 passes=1, seed=0, flow=None, lse_sigma=0.1, mppi_noise=0.3, impl="jax"):
+        """flow: a directory from ksos_train_flow.py; its sampler then draws the first-pass candidates.
+        lse_sigma, mppi_noise: first-pass LSE smoothing noise and MPPI sampling noise (both 0.3 in
+        Global-MPPI; 0.1 LSE was best on the push over 20 seeds, 0.3 and 0.03 had longer stalls).
+        impl: MJX backend, "jax" or "warp" (MuJoCo Warp, much faster rollouts in contact)."""
+        if impl == "warp":  # 50 line-search iterations: no overflow warnings, and faster than the XML's 10
+            task.mj_model.opt.ls_iterations = 50
+            task.model = mjx.put_model(task.mj_model, impl="warp")
+        sampler = None
+        if flow is not None:
+            from whole_body_mppi.ksos.flow_sampler import make_flow_sampler
+            sampler = make_flow_sampler(flow, task, num_knots, lse_sigma)
         self.ctrl = GlobalMPPI(task, num_samples=mppi_samples, noise_level=0.1, temperature=0.1,
                                spline_type="cubic", plan_horizon=horizon, num_knots=num_knots, iterations=1,
-                               ksos_solver="newton-rs", ksos_sampling="uniform", ksos_num_samples=ksos_samples,
-                               elite_num=min(80, ksos_samples))
+                               ksos_solver="newton-rs", ksos_sampling="uniform" if flow is None else "flow",
+                               ksos_num_samples=ksos_samples, elite_num=min(80, ksos_samples),
+                               ksos_flow_sampler=sampler)
         self.ctrl.lse_num_samples = lse_samples
+        # by default both are the same array; .at makes new ones, so they are set independently
+        self.ctrl.lse_smoothing_sigma = self.ctrl.lse_smoothing_sigma.at[0].set(lse_sigma)
+        self.ctrl.mppi_noise = self.ctrl.mppi_noise.at[0].set(mppi_noise)
         self.ctrl.ksos_warm_start = True  # the shifted previous plan is one of the KSOS candidates
         self.passes = passes
         self._rollout = jax.jit(self.ctrl.ksos_rollout)
-        self._mppi = jax.jit(self.ctrl.safeguarded_optimize)
+        self._refine = jax.jit(self.refine)
         self._interp = jax.jit(self.ctrl.interp_func)
-        self.data = mjx.put_data(task.mj_model, mujoco.MjData(task.mj_model))
+        kw = {}
+        if impl == "warp":  # one contact buffer for the whole batch: the KSOS pass (candidates + LSE samples)
+            kw = dict(naconmax=32 * max(ksos_samples * (lse_samples + 1), 2 * mppi_samples), njmax=128)
+        self.data = mjx.put_data(task.mj_model, mujoco.MjData(task.mj_model), impl=impl, **kw)
         self.reset(seed)
 
     def reset(self, seed=0):
@@ -54,6 +72,25 @@ class KSOSPlanner:
                        bounds=[(np.log(1e-2), np.log(30.0))])
         self.ctrl.ksos_sigma = float(np.exp(res.x[0]))
 
+    def refine(self, state, p):
+        """MPPI step as GlobalMPPI.safeguarded_optimize samples it (noise around the KSOS mean and around
+        the best candidate, sample 0 of each is the start itself), but the plan is the best sample, not
+        the softmax mean. Its cost is known from this one rollout pass, so no rollout to check it, and it
+        is never worse than either start. (At temperature 0.1 the softmax is nearly an argmin anyway;
+        averaging near-ties often gave a worse plan, which then needed the check.)"""
+        c = self.ctrl
+        tk = jnp.linspace(0.0, c.plan_horizon, c.num_knots) + state.time
+        shift = lambda knots: c.interp_func(tk, p.tk, knots[None])[0]
+        p = p.replace(tk=tk)
+        samples = []
+        for start in (shift(p.mean), shift(p.knots[jnp.argmin(p.cand_cost)])):
+            knots, sampled = c.sample_knots(p.replace(mean=start))  # same noise for both starts
+            samples.append(jnp.clip(knots, c.task.u_min, c.task.u_max))
+        knots = jnp.concatenate(samples)
+        costs = c.rollout(state, tk, knots).costs.sum(-1)
+        best = jnp.argmin(costs)
+        return sampled.replace(mean=knots[best], rng=jax.random.split(sampled.rng)[0]), costs[best]
+
     def solve(self, d):
         """Replan from MuJoCo data d (trunk model layout). Returns the cost of the new plan."""
         t0 = time.time()
@@ -64,7 +101,7 @@ class KSOSPlanner:
             self._fit_sigma(p)
             p = self.ctrl.solve_ksos(p, state)
             p = p.replace(mean=p.ksos_mean)
-            p, _, cost, _ = self._mppi(state, p)
+            p, cost = self._refine(state, p)
         self.params = p
         self.last_cost, self.last_time = float(cost), time.time() - t0
         return self.last_cost

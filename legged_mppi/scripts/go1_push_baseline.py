@@ -37,7 +37,7 @@ def run_seed(seed, goal, tol, t_final, out_dir):
     mujoco.mj_resetDataKeyframe(model, data, 0)
     mujoco.mj_forward(model, data)
 
-    box, robot, phase = [], [], []
+    box, robot, phase, qpos, ref = [], [], [], [], []
     t_goal = np.nan
     for k in range(int(t_final / 0.01)):
         data.ctrl[:] = ctrl.update(np.r_[data.qpos, data.qvel])
@@ -47,13 +47,14 @@ def run_seed(seed, goal, tol, t_final, out_dir):
 
         box.append(data.qpos[:7].copy())
         robot.append(data.qpos[7:14].copy())
-        phase.append(ctrl.goal_index)
+        phase.append(ctrl.goal_index); qpos.append(data.qpos.copy()); ref.append(ctrl.body_ref[:3].copy())
         if np.linalg.norm(data.qpos[:2] - goal) < tol:
             t_goal = (k + 1) * 0.01
             break
 
     box, robot = np.array(box), np.array(robot)
     np.savez(os.path.join(out_dir, f"seed{seed}.npz"), box=box, robot=robot, phase=np.array(phase),
+             qpos=np.array(qpos), ref=np.array(ref),  # for render_push.py
              goal=goal, tol=tol, t_goal=t_goal, mujoco_version=mujoco.__version__)
     err = np.linalg.norm(box[-1, :2] - goal)
     print(f"seed {seed}: {'OK ' if np.isfinite(t_goal) else 'FAIL'} t_goal={t_goal:.2f} "
