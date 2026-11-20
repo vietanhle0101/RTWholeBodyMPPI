@@ -38,8 +38,11 @@ def make_planner(args, seed):
             from whole_body_mppi.ksos.planner import KSOSPushPlanner
             _KSOS = KSOSPushPlanner(args.goal, passes=args.passes, flow=args.flow, lse_sigma=args.lse_sigma,
                                     mppi_noise=args.mppi_noise, ksos_samples=args.ksos_samples,
-                                    impl=args.impl)
+                                    impl=args.impl, ksos_solver=args.ksos_solver,
+                                    ksos_kernel=args.ksos_kernel, ksos_lambda=args.ksos_lambda,
+                                    lse_samples=args.lse_samples, ksos_model=args.ksos_model)
         _KSOS.reset(seed)
+        _KSOS.ksos.record = [] if args.record else None
         return _KSOS
     raise ValueError(args.planner)
 
@@ -117,6 +120,9 @@ def run(seed, args, out_dir):
     d = (goal - box0) / np.linalg.norm(goal - box0)
     report(seed, box, trunk, refs, goal, box0, d, t_goal)
     print(f"   seed {seed}: mode switches {switches}, finished {'%.1f s' % t_done if t_done else 'no'}", flush=True)
+    if args.planner == "ksos" and planner.ksos.record:  # one array per field, a row per replan
+        rec = planner.ksos.record
+        np.savez(os.path.join(out_dir, f"sdp_seed{seed}.npz"), **{k: np.stack([np.asarray(r[k]) for r in rec]) for k in rec[0]})
     if getattr(planner, "solve_times", None):
         st = planner.solve_times[1:] or planner.solve_times  # the first solve includes jit
         print(f"   seed {seed}: {len(planner.solve_times)} replans, solve median {np.median(st):.1f} s", flush=True)
@@ -131,6 +137,14 @@ if __name__ == "__main__":
     p.add_argument("--mppi-noise", type=float, default=0.3, help="first-pass MPPI sampling noise")
     p.add_argument("--ksos-samples", type=int, default=64, help="KSOS candidates per pass")
     p.add_argument("--impl", default="jax", choices=["jax", "warp"], help="MJX backend of the planner rollouts")
+    p.add_argument("--ksos-solver", default="newton-rs", choices=["newton-rs", "naive"],
+                   help="naive: best KSOS candidate instead of the SDP solution")
+    p.add_argument("--ksos-kernel", default="iso", choices=["iso", "fixed", "learned"],
+                   help="fixed: per-knot length scales FIXED_ELL; learned: the fixed SDP solved by --ksos-model")
+    p.add_argument("--ksos-model", help="learned KSOS solver (ksos_train_sdp.py --output)")
+    p.add_argument("--ksos-lambda", type=float, default=1e-5, help="KSOS SDP regularization")
+    p.add_argument("--lse-samples", type=int, default=16, help="LSE smoothing samples per KSOS candidate")
+    p.add_argument("--record", action="store_true", help="save each replan's KSOS problem (sdp_seed<N>.npz; fixed)")
     p.add_argument("--goal", type=float, nargs=2, default=[2.0, -0.75])
     p.add_argument("--replan", type=float, default=0.2, help="replanning period [s]")
     p.add_argument("--hold", type=float, default=1.0, help="stand still before the first plan [s]")

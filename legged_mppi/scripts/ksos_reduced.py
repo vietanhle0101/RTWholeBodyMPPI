@@ -143,6 +143,8 @@ if __name__ == "__main__":
     p.add_argument("--mppi-noise", type=float, default=0.3, help="first-pass MPPI sampling noise")
     p.add_argument("--ksos-samples", type=int, default=64, help="KSOS candidates per pass")
     p.add_argument("--impl", default="jax", choices=["jax", "warp"], help="MJX backend of the planner rollouts")
+    p.add_argument("--ksos-solver", default="newton-rs", choices=["newton-rs", "naive"],
+                   help="naive: best KSOS candidate instead of the SDP solution")
     p.add_argument("--seeds", default="0-4")
     p.add_argument("--view", action="store_true", help="live viewer; runs only the first seed")
     p.add_argument("--replay", help="play a logged seed*.npz in the viewer instead of running")
@@ -157,7 +159,7 @@ if __name__ == "__main__":
 
     planner = KSOSPlanner(Go1PushTask(), passes=args.passes, flow=args.flow, lse_sigma=args.lse_sigma,
                           mppi_noise=args.mppi_noise, ksos_samples=args.ksos_samples,
-                          impl=args.impl)
+                          impl=args.impl, ksos_solver=args.ksos_solver)
     out = os.path.join("logs", "ksos_reduced", f"{datetime.now():%Y%m%d_%H%M%S}_goal{args.goal[0]:g}_{args.goal[1]:g}")
     os.makedirs(out)
     print("logging to", out)

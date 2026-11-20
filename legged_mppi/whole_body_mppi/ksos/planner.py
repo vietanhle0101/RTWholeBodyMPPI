@@ -16,14 +16,25 @@ from global_mppi.simulation.deterministic import neg_lml
 from mujoco import mjx
 from scipy.optimize import minimize
 
+# per-knot length scales of the "fixed" SDP: the median of per-replan GP marginal-likelihood fits over
+# closed-loop pushes; offline they gave better plans after the MPPI step than fitting each replan
+FIXED_ELL = (5.23, 1.33, 3.06, 2.67, 4.33, 8.41, 7.18, 100.0)
+
 
 class KSOSPlanner:
     def __init__(self, task, horizon=4.0, num_knots=8, ksos_samples=64, lse_samples=16, mppi_samples=256,
-                 passes=1, seed=0, flow=None, lse_sigma=0.1, mppi_noise=0.3, impl="jax"):
+                 passes=1, seed=0, flow=None, lse_sigma=0.1, mppi_noise=0.3, impl="jax", ksos_solver="newton-rs",
+                 ksos_kernel="iso", ksos_lambda=1e-5, ksos_model=None):
         """flow: a directory from ksos_train_flow.py; its sampler then draws the first-pass candidates.
         lse_sigma, mppi_noise: first-pass LSE smoothing noise and MPPI sampling noise (both 0.3 in
         Global-MPPI; 0.1 LSE was best on the push over 20 seeds, 0.3 and 0.03 had longer stalls).
-        impl: MJX backend, "jax" or "warp" (MuJoCo Warp, much faster rollouts in contact)."""
+        impl: MJX backend, "jax" or "warp" (MuJoCo Warp, much faster rollouts in contact).
+        ksos_solver: "newton-rs" solves the KSOS SDP; "naive" takes the best candidate instead (no SDP).
+        ksos_kernel: "iso", one Laplace width fitted as in run_interactive; "fixed", the knots divided by
+        FIXED_ELL at width 1; "learned", the "fixed" SDP solved by the learned solver in ksos_model
+        (sdp_l2o, trained by ksos_train_sdp.py). ksos_lambda: the SDP's regularization (Global-MPPI: 1e-5,
+        which makes the solution the best candidate; 0.1 with "fixed" gives better plans after the MPPI step)."""
+        assert ksos_kernel not in ("fixed", "learned") or num_knots == len(FIXED_ELL)
         if impl == "warp":  # 50 line-search iterations: no overflow warnings, and faster than the XML's 10
             task.mj_model.opt.ls_iterations = 50
             task.model = mjx.put_model(task.mj_model, impl="warp")
@@ -33,7 +44,7 @@ class KSOSPlanner:
             sampler = make_flow_sampler(flow, task, num_knots, lse_sigma)
         self.ctrl = GlobalMPPI(task, num_samples=mppi_samples, noise_level=0.1, temperature=0.1,
                                spline_type="cubic", plan_horizon=horizon, num_knots=num_knots, iterations=1,
-                               ksos_solver="newton-rs", ksos_sampling="uniform" if flow is None else "flow",
+                               ksos_solver=ksos_solver, ksos_sampling="uniform" if flow is None else "flow",
                                ksos_num_samples=ksos_samples, elite_num=min(80, ksos_samples),
                                ksos_flow_sampler=sampler)
         self.ctrl.lse_num_samples = lse_samples
@@ -41,6 +52,13 @@ class KSOSPlanner:
         self.ctrl.lse_smoothing_sigma = self.ctrl.lse_smoothing_sigma.at[0].set(lse_sigma)
         self.ctrl.mppi_noise = self.ctrl.mppi_noise.at[0].set(mppi_noise)
         self.ctrl.ksos_warm_start = True  # the shifted previous plan is one of the KSOS candidates
+        self.ctrl.ksos_lambda = ksos_lambda
+        self.kernel = ksos_kernel
+        if ksos_kernel == "learned":
+            from whole_body_mppi.ksos.sdp_l2o import load
+            self._l2o, meta = load(ksos_model)
+            assert tuple(meta["ell"]) == FIXED_ELL and meta["solver"]["lambd"] == ksos_lambda
+        self.record = None  # a list to append each replan's KSOS problem to ("fixed")
         self.passes = passes
         self._rollout = jax.jit(self.ctrl.ksos_rollout)
         self._refine = jax.jit(self.refine)
@@ -72,6 +90,31 @@ class KSOSPlanner:
                        bounds=[(np.log(1e-2), np.log(30.0))])
         self.ctrl.ksos_sigma = float(np.exp(res.x[0]))
 
+    def _solve_ksos(self, p, state):
+        """KSOS on the candidates; "fixed" and "learned" on the knots divided by FIXED_ELL (width 1)."""
+        from whole_body_mppi.ksos.flow_sampler import state_context
+        if self.ctrl.ksos_solver == "naive":
+            return self.ctrl.solve_ksos(p, state)
+        if self.kernel == "iso":
+            self._fit_sigma(p)
+            return self.ctrl.solve_ksos(p, state)
+        if self.kernel == "learned":
+            active = np.asarray(self.ctrl.task.u_max > self.ctrl.task.u_min)
+            x = np.asarray(p.knots)[:, :, active].reshape(p.knots.shape[0], -1)
+            _, alpha = self._l2o(x, p.lse_cost, state_context(state))
+            return p.replace(ksos_mean=jnp.tensordot(jnp.asarray(alpha, jnp.float32), p.knots, 1))
+        if self.record is not None:  # training data for the learned solver, and the state to replay it
+            self.record.append(dict(knots=p.knots, lse_cost=p.lse_cost, cand_cost=p.cand_cost, tk=p.tk,
+                                    context=state_context(state), qpos=state.qpos, qvel=state.qvel,
+                                    time=state.time, goal=state.mocap_pos[0, :2]))
+        scale = jnp.asarray(FIXED_ELL, jnp.float32)[:, None]
+        self.ctrl.ksos_sigma = 1.0
+        scaled = p.replace(knots=p.knots / scale)
+        q = self.ctrl.solve_ksos(scaled, state)
+        if q is scaled:  # solve failed, solve_ksos returned its input
+            return p
+        return p.replace(ksos_mean=q.ksos_mean * scale, ksos_result_cost=q.ksos_result_cost)
+
     def refine(self, state, p):
         """MPPI step as GlobalMPPI.safeguarded_optimize samples it (noise around the KSOS mean and around
         the best candidate, sample 0 of each is the start itself), but the plan is the best sample, not
@@ -98,8 +141,7 @@ class KSOSPlanner:
         p = self.params
         for i in range(self.passes):
             p = self._rollout(state, p.replace(iter=i))
-            self._fit_sigma(p)
-            p = self.ctrl.solve_ksos(p, state)
+            p = self._solve_ksos(p, state)
             p = p.replace(mean=p.ksos_mean)
             p, cost = self._refine(state, p)
         self.params = p
