@@ -1,0 +1,88 @@
+{
+  "solver": {
+    "sigma": 1.0,
+    "lambd": 0.1,
+    "epsilon": 0.01,
+    "kernel_jitter": 1e-10,
+    "hidden_dim": 96,
+    "gnn_layers": 3,
+    "newton_steps": 3,
+    "tau": 20.0,
+    "kkt_damping": 1e-06,
+    "psd_floor": 1e-06,
+    "warm_start_fraction": 0.95,
+    "initial_step_size": 0.8,
+    "warm_start_temperature": 0.2,
+    "warm_start_mix": 0.1
+  },
+  "dim": 16,
+  "context_dim": 13,
+  "num_knots": 8,
+  "ell": [
+    5.23,
+    1.33,
+    3.06,
+    2.67,
+    4.33,
+    8.41,
+    7.18,
+    100.0
+  ],
+  "lb": [
+    -1.0,
+    -1.0,
+    -1.0,
+    -1.0,
+    -1.0,
+    -1.0,
+    -1.0,
+    -1.0,
+    -1.0,
+    -1.0,
+    -1.0,
+    -1.0,
+    -1.0,
+    -1.0,
+    -1.0,
+    -1.0
+  ],
+  "ub": [
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0
+  ],
+  "active": [
+    0,
+    2
+  ],
+  "files": 80,
+  "args": {
+    "data": [
+      "logs/sdp_data_20261119"
+    ],
+    "output": "logs/ksos_sdp/fixed1",
+    "newton_steps": 3,
+    "epochs": 60,
+    "steps_per_epoch": 100,
+    "batch_size": 32,
+    "lr": 0.001,
+    "decay": 0.5,
+    "val_frac": 0.1,
+    "test_frac": 0.15,
+    "seed": 0,
+    "eval_only": false
+  }
+}

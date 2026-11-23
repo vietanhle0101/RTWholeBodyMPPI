@@ -1,0 +1,1 @@
+"PyTreeDef({'gnn': {'embed': {'b': *, 'w': *}, 'head': {'b': *, 'w': *}, 'layers': [{'message': {'b': *, 'w': *}, 'self': {'b': *, 'w': *}}, {'message': {'b': *, 'w': *}, 'self': {'b': *, 'w': *}}, {'message': {'b': *, 'w': *}, 'self': {'b': *, 'w': *}}], 'theta_embed': [{'b': *, 'w': *}, {'b': *, 'w': *}]}, 'schedule': {'head': {'b': *, 'w': *}, 'hidden': {'b': *, 'w': *}}})"

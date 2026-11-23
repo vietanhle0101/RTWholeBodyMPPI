@@ -31,6 +31,7 @@ A Python implementation of a **Model Predictive Path Integral (MPPI)** controlle
 - [Tasks](#tasks)
 - [Simulation](#simulation)
 - [Notebooks](#notebooks)
+- [KSOS Global Planner for Box Pushing](#ksos-global-planner-for-box-pushing)
 - [Hardware](#hardware)
 - [Definitions](#definitions)
 - [License](#license)
@@ -145,6 +146,72 @@ If you are using the docker container:
 ```bash
 rosrun legged_mppi simulate_mppi.py --task stairs
 ``` 
+---
+## KSOS Global Planner for Box Pushing
+The Go1 box push with a global planner on top of the whole-body MPPI controller. Every 0.5 s, a
+KernelSOS (KSOS) + MPPI planner from [Global-MPPI](https://github.com/vietanhle0101/Global-MPPI) plans
+the trunk motion on a reduced model (box + planar trunk), simulating its candidates in parallel on the GPU
+with MuJoCo Warp. The whole-body MPPI controller tracks that trunk plan on the full Go1. The planner
+uses two learned components, both in [`trained_models/`](trained_models/):
+
+- `flow_lse01/`: a learned sampler (conditional normalizing flow) that proposes the KSOS candidates;
+- `sdp_fixed1/`: a learned solver for the KSOS SDP (GNN warm start + 3 unrolled Newton steps).
+
+The code is in `legged_mppi/whole_body_mppi/ksos/` and `legged_mppi/scripts/run_push.py`.
+
+### Setup
+Needs Linux, an NVIDIA GPU with a CUDA 12 driver, and Python 3.12. The planner lives in Global-MPPI
+(branch `l2s`), which you need read access to. Clone it next to this repository, with its `ksos-tools`
+submodule:
+```bash
+git clone -b l2s --recurse-submodules https://github.com/vietanhle0101/Global-MPPI.git
+git clone -b l2o-ksos https://github.com/vietanhle0101/RTWholeBodyMPPI.git
+cd RTWholeBodyMPPI
+uv venv --python 3.12 .venv-ksos && source .venv-ksos/bin/activate   # or python3.12 -m venv .venv-ksos
+uv pip install "jax[cuda12]==0.5.3" mujoco==3.16.0 mujoco-mjx==3.16.0 mujoco-warp==3.16.0 warp-lang==1.18.0
+uv pip install -e ../Global-MPPI -e ../Global-MPPI/ksos-tools -e legged_mppi
+uv pip install flax optax imageio[ffmpeg] matplotlib
+```
+`ksos_l2o` (the learned sampler and solver) is not installed: it is imported from the Global-MPPI
+checkout next to the installed `global_mppi` package, so keep the editable install. Check the setup with
+```bash
+python -c "import jax, mujoco_warp, global_mppi, ksos_tools, whole_body_mppi; print(jax.devices())"
+```
+which should list a CUDA device.
+
+### Run the test
+From the repository root, the full planner (learned sampler + learned solver) on the three goals of the
+push (the box starts at (1, 0), the robot at the origin):
+```bash
+M=trained_models
+ARGS="--planner ksos --replan 0.5 --impl warp --flow $M/flow_lse01 --ksos-kernel learned \
+      --ksos-model $M/sdp_fixed1 --ksos-lambda 0.1 --lse-samples 64"
+python legged_mppi/scripts/run_push.py $ARGS --seeds 0-19                  # default goal (2, -0.75)
+python legged_mppi/scripts/run_push.py $ARGS --goal 1 -1.5 --seeds 0-19    # side
+python legged_mppi/scripts/run_push.py $ARGS --goal -0.5 0 --seeds 0-19    # behind: walk around the box
+```
+Use `--seeds 0` for a single quick run, and add `--view` to watch it in the MuJoCo viewer (it runs only
+the first seed). The first replans of a run are slow while JAX compiles.
+
+Each seed prints a line such as
+```
+seed 0: OK  t_goal=11.2s  final box err 0.038 m  ...
+   seed 0: 32 replans, solve median 0.5 s
+```
+`OK` means the box got within 0.3 m of the goal, and `t_goal` is when it did. A run logs to
+`logs/run_push/<time>_ksos_goal<x>_<y>/` (a `seed<N>.npz` per seed and a plot of the paths). To make a
+video of a seed:
+```bash
+python legged_mppi/scripts/render_push.py logs/run_push/<run>/seed0.npz   # writes seed0.mp4 next to it
+```
+
+Reference results on an RTX 4080 SUPER, 20 seeds per goal: 20/20 successes on each goal, median
+`t_goal` 10.3 s (default), 18.7 s (side) and 39.4 s (behind), about 0.5 s per replan. MuJoCo Warp is not
+deterministic, so individual seeds differ from run to run; compare over 20 or more seeds.
+
+**Baselines**: drop `--flow ...` for uniformly sampled candidates, and replace
+`--ksos-kernel learned --ksos-model ...` with `--ksos-kernel fixed` to solve the same SDP with Newton's
+method.
 ---
 ## Hardware
 ### Locomotion tasks
