@@ -24,7 +24,7 @@ FIXED_ELL = (5.23, 1.33, 3.06, 2.67, 4.33, 8.41, 7.18, 100.0)
 class KSOSPlanner:
     def __init__(self, task, horizon=4.0, num_knots=8, ksos_samples=64, lse_samples=16, mppi_samples=256,
                  passes=1, seed=0, flow=None, lse_sigma=0.1, mppi_noise=0.3, impl="jax", ksos_solver="newton-rs",
-                 ksos_kernel="iso", ksos_lambda=1e-5, ksos_model=None):
+                 ksos_kernel="iso", ksos_lambda=1e-5, ksos_model=None, one_pass=False):
         """flow: a directory from ksos_train_flow.py; its sampler then draws the first-pass candidates.
         lse_sigma, mppi_noise: first-pass LSE smoothing noise and MPPI sampling noise (both 0.3 in
         Global-MPPI; 0.1 LSE was best on the push over 20 seeds, 0.3 and 0.03 had longer stalls).
@@ -33,7 +33,9 @@ class KSOSPlanner:
         ksos_kernel: "iso", one Laplace width fitted as in run_interactive; "fixed", the knots divided by
         FIXED_ELL at width 1; "learned", the "fixed" SDP solved by the learned solver in ksos_model
         (sdp_l2o, trained by ksos_train_sdp.py). ksos_lambda: the SDP's regularization (Global-MPPI: 1e-5,
-        which makes the solution the best candidate; 0.1 with "fixed" gives better plans after the MPPI step)."""
+        which makes the solution the best candidate; 0.1 with "fixed" gives better plans after the MPPI step).
+        one_pass: one rollout batch per replan (see one_pass) instead of the KSOS pass and then the refine."""
+        assert not one_pass or passes == 1
         assert ksos_kernel not in ("fixed", "learned") or num_knots == len(FIXED_ELL)
         if impl == "warp":  # 50 line-search iterations: no overflow warnings, and faster than the XML's 10
             task.mj_model.opt.ls_iterations = 50
@@ -59,13 +61,16 @@ class KSOSPlanner:
             self._l2o, meta = load(ksos_model)
             assert tuple(meta["ell"]) == FIXED_ELL and meta["solver"]["lambd"] == ksos_lambda
         self.record = None  # a list to append each replan's KSOS problem to ("fixed")
-        self.passes = passes
+        self.passes, self.one_pass = passes, one_pass
         self._rollout = jax.jit(self.ctrl.ksos_rollout)
+        self._one_pass = jax.jit(self.one_pass_rollout)
         self._refine = jax.jit(self.refine)
         self._interp = jax.jit(self.ctrl.interp_func)
         kw = {}
         if impl == "warp":  # one contact buffer for the whole batch: the KSOS pass (candidates + LSE samples)
-            kw = dict(naconmax=32 * max(ksos_samples * (lse_samples + 1), 2 * mppi_samples), njmax=128)
+            ksos_batch, refine_batch = ksos_samples * (lse_samples + 1), 2 * mppi_samples
+            batch = ksos_batch + refine_batch if one_pass else max(ksos_batch, refine_batch)
+            kw = dict(naconmax=32 * batch, njmax=128)
         self.data = mjx.put_data(task.mj_model, mujoco.MjData(task.mj_model), impl=impl, **kw)
         self.reset(seed)
 
@@ -134,12 +139,41 @@ class KSOSPlanner:
         best = jnp.argmin(costs)
         return sampled.replace(mean=knots[best], rng=jax.random.split(sampled.rng)[0]), costs[best]
 
+    def one_pass_rollout(self, state, p):
+        """The KSOS pass and the refine in one rollout batch: the KSOS candidates and their LSE samples
+        as in ksos_rollout, and the refine's samples around the previous replan's KSOS solution and
+        around the previous plan (both shifted to now). The plan is the best of the refine samples and
+        the candidates; this replan's KSOS solution is refined at the next replan."""
+        c, lo, hi = self.ctrl, self.ctrl.task.u_min, self.ctrl.task.u_max
+        tk = jnp.linspace(0.0, c.plan_horizon, c.num_knots) + state.time
+        shift = lambda knots: jnp.clip(c.interp_func(tk, p.tk, knots[None])[0], lo, hi)
+        plan, z = shift(p.mean), shift(p.ksos_mean)
+        q = p.replace(tk=tk, mean=plan, iter=0)
+        cand, q = c.sample_ksos_knots(q, state)
+        cand = jnp.clip(cand.at[0].set(plan), lo, hi)  # warm start
+        lse, q = c.sample_lse_knots(cand, q)
+        refine = jnp.clip(jnp.concatenate([c.sample_knots(q.replace(mean=s))[0] for s in (z, plan)]), lo, hi)
+        _, q = c.sample_knots(q)  # same noise for both starts, then a new rng
+        n, m = lse.shape[:2]
+        steps = c.rollout(state, tk, jnp.concatenate([cand, lse.reshape(n * m, *cand.shape[1:]), refine])).costs
+        costs = steps.sum(-1)
+        lse_steps = steps[n:n + n * m].reshape(n, m, -1)
+        f = lse_steps.sum(-1)  # LSE cost as in lse_smoothing_rollout
+        lse_cost = f.min(1) - c.lse_lambda * jnp.log(jnp.mean(jnp.exp(-(f - f.min(1, keepdims=True)) / c.lse_lambda), 1))
+        pool, pool_cost = jnp.concatenate([refine, cand]), jnp.concatenate([costs[n + n * m:], costs[:n]])
+        best = jnp.argmin(pool_cost)
+        return q.replace(knots=cand, cost=lse_steps, cand_cost=costs[:n], lse_cost=lse_cost), pool[best], pool_cost[best]
+
     def solve(self, d):
         """Replan from MuJoCo data d (trunk model layout). Returns the cost of the new plan."""
         t0 = time.time()
         state = self._state(d)
         p = self.params
-        for i in range(self.passes):
+        if self.one_pass:
+            p, plan, cost = self._one_pass(state, p)
+            q = self._solve_ksos(p, state)
+            p = (p.replace(ksos_mean=plan) if q is p else q).replace(mean=plan)  # failed solve: refine the plan
+        for i in range(0 if self.one_pass else self.passes):
             p = self._rollout(state, p.replace(iter=i))
             p = self._solve_ksos(p, state)
             p = p.replace(mean=p.ksos_mean)
@@ -174,6 +208,11 @@ def yaw_of(q):
     return np.arctan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
 
 
+def cube_yaw_error(yaw, goal_yaw):
+    """Box yaw minus the goal's, in (-pi/4, pi/4] (a cube looks the same every quarter turn)."""
+    return 0.25 * np.arctan2(np.sin(4 * (yaw - goal_yaw)), np.cos(4 * (yaw - goal_yaw)))
+
+
 class KSOSPushPlanner:
     """Global trunk plan for the Go1 push, same interface as GeometricPushPlanner: plan(t, qpos, qvel) on
     the Go1 state (qpos = [box 7, robot 19], qvel = [box 6, robot 18]); it also returns a heading.
@@ -182,10 +221,14 @@ class KSOSPushPlanner:
     is rolled out in C MuJoCo (10 ms) to give the trunk path (t, P, V, yaw) for BodyReference.
     """
 
-    def __init__(self, goal, done_tol=0.1, rollout_dt=0.01, **planner_kwargs):
+    def __init__(self, goal, goal_yaw=None, done_tol=0.1, yaw_tol=np.radians(5), w_yaw=10.0, k_turn=0.15,
+                 rollout_dt=0.01, **planner_kwargs):
+        """goal_yaw [rad]: also turn the box to this yaw (modulo 90 deg), with the task's w_yaw and k_turn;
+        None: position only, as before."""
         from whole_body_mppi.ksos.task import XML, Go1PushTask
-        self.goal, self.done_tol = np.asarray(goal, float), done_tol
-        self.ksos = KSOSPlanner(Go1PushTask(), **planner_kwargs)
+        self.goal, self.goal_yaw, self.done_tol, self.yaw_tol = np.asarray(goal, float), goal_yaw, done_tol, yaw_tol
+        task = Go1PushTask() if goal_yaw is None else Go1PushTask(w_yaw=w_yaw, k_turn=k_turn)
+        self.ksos = KSOSPlanner(task, **planner_kwargs)
         self.m = mujoco.MjModel.from_xml_path(XML)
         self.m.opt.timestep = rollout_dt
         self.d = mujoco.MjData(self.m)
@@ -204,8 +247,12 @@ class KSOSPushPlanner:
         d.qvel[6:8], d.qvel[8] = qvel[6:8], qvel[11]             # world xy velocity, yaw rate (base z)
         d.ctrl[:] = self.ksos.controls([t])[0]                   # what the previous plan commands now
         d.mocap_pos[0, :2] = self.goal
+        done = np.linalg.norm(qpos[0:2] - self.goal) < self.done_tol
+        if self.goal_yaw is not None:
+            d.mocap_quat[0] = [np.cos(self.goal_yaw / 2), 0, 0, np.sin(self.goal_yaw / 2)]
+            done &= abs(cube_yaw_error(yaw_of(qpos[3:7]), self.goal_yaw)) < self.yaw_tol
         mujoco.mj_forward(m, d)
-        if np.linalg.norm(qpos[0:2] - self.goal) < self.done_tol:
+        if done:
             self.mode = "done"
             return np.array([t, t + 1.0]), np.repeat(d.qpos[None, 7:9], 2, 0), np.zeros((2, 2)), np.full(2, d.qpos[9])
 

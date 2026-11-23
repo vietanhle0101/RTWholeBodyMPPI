@@ -46,3 +46,5 @@ build/
 *.so
 .venv-*/
 logs/
+videos/
+MUJOCO_LOG.TXT

@@ -40,7 +40,9 @@ def make_planner(args, seed):
                                     mppi_noise=args.mppi_noise, ksos_samples=args.ksos_samples,
                                     impl=args.impl, ksos_solver=args.ksos_solver,
                                     ksos_kernel=args.ksos_kernel, ksos_lambda=args.ksos_lambda,
-                                    lse_samples=args.lse_samples, ksos_model=args.ksos_model)
+                                    lse_samples=args.lse_samples, ksos_model=args.ksos_model,
+                                    one_pass=args.one_pass, w_yaw=args.w_yaw, k_turn=args.k_turn,
+                                    goal_yaw=None if args.goal_yaw is None else np.radians(args.goal_yaw))
         _KSOS.reset(seed)
         _KSOS.ksos.record = [] if args.record else None
         return _KSOS
@@ -54,6 +56,9 @@ def run(seed, args, out_dir):
     from whole_body_mppi.control.reference import BodyReference
 
     goal = np.array(args.goal)
+    def yaw_err(q):  # box yaw minus the goal's, modulo the cube's quarter turn [rad]
+        e = 4 * (2 * np.arctan2(q[3], q[0]) - np.radians(args.goal_yaw))
+        return 0.25 * np.arctan2(np.sin(e), np.cos(e))
     ctrl = MPPI_box_push("push_box")
     ctrl.random_generator = np.random.default_rng(seed)
     ctrl.x_box_ref[:2] = goal
@@ -66,6 +71,7 @@ def run(seed, args, out_dir):
     box0 = data.qpos[:2].copy()
 
     planner = make_planner(args, seed)
+    yaw_ok = lambda q: args.goal_yaw is None or abs(np.degrees(yaw_err(q))) < args.yaw_tol
     ref = BodyReference(yaw0=0.0)
     ref.set_plan(*polyline(0.0, [data.qpos[7:9].copy()], []))  # stand still until the first replan
     next_replan = args.hold
@@ -90,7 +96,7 @@ def run(seed, args, out_dir):
 
         box.append(data.qpos[:7].copy()); trunk.append(data.qpos[7:14].copy()); qpos.append(data.qpos.copy())
         refs.append(ctrl.ref_traj[0, :3].copy()); modes.append(planner.mode)
-        if np.isnan(t_goal) and np.linalg.norm(data.qpos[:2] - goal) < args.tol:
+        if np.isnan(t_goal) and np.linalg.norm(data.qpos[:2] - goal) < args.tol and yaw_ok(data.qpos[3:7]):
             t_goal = data.time
         if planner.mode == "done" and t_done is None:
             t_done = data.time
@@ -116,16 +122,22 @@ def run(seed, args, out_dir):
     box, trunk, refs = np.array(box), np.array(trunk), np.array(refs)
     switches = sum(a != b for a, b in zip(modes[:-1], modes[1:]))
     np.savez(os.path.join(out_dir, f"seed{seed}.npz"), box=box, trunk=trunk, ref=refs, plan_P=refs[:, :2],
-             qpos=np.array(qpos), goal=goal, t_goal=t_goal, modes=np.array(modes))
+             qpos=np.array(qpos), goal=goal, t_goal=t_goal, modes=np.array(modes),
+             goal_yaw=np.nan if args.goal_yaw is None else args.goal_yaw,  # deg
+             solve_times=np.array(getattr(planner, "solve_times", [])))  # per replan [s], the first includes jit
     d = (goal - box0) / np.linalg.norm(goal - box0)
     report(seed, box, trunk, refs, goal, box0, d, t_goal)
+    if args.goal_yaw is not None:
+        e = np.degrees([yaw_err(q) for q in box[:, 3:7]])
+        print(f"   seed {seed}: box yaw error to the goal: start {e[0]:+.0f} deg, end {e[-1]:+.0f} deg", flush=True)
     print(f"   seed {seed}: mode switches {switches}, finished {'%.1f s' % t_done if t_done else 'no'}", flush=True)
     if args.planner == "ksos" and planner.ksos.record:  # one array per field, a row per replan
         rec = planner.ksos.record
         np.savez(os.path.join(out_dir, f"sdp_seed{seed}.npz"), **{k: np.stack([np.asarray(r[k]) for r in rec]) for k in rec[0]})
     if getattr(planner, "solve_times", None):
-        st = planner.solve_times[1:] or planner.solve_times  # the first solve includes jit
-        print(f"   seed {seed}: {len(planner.solve_times)} replans, solve median {np.median(st):.1f} s", flush=True)
+        st = planner.solve_times[2:] or planner.solve_times  # the first two include jit (the params get filled in)
+        print(f"   seed {seed}: {len(planner.solve_times)} replans, solve mean {1e3 * np.mean(st):.0f} ms, "
+              f"median {1e3 * np.median(st):.0f} ms, max {1e3 * np.max(st):.0f} ms", flush=True)
 
 
 if __name__ == "__main__":
@@ -144,8 +156,14 @@ if __name__ == "__main__":
     p.add_argument("--ksos-model", help="learned KSOS solver (ksos_train_sdp.py --output)")
     p.add_argument("--ksos-lambda", type=float, default=1e-5, help="KSOS SDP regularization")
     p.add_argument("--lse-samples", type=int, default=16, help="LSE smoothing samples per KSOS candidate")
+    p.add_argument("--one-pass", action="store_true",
+                   help="one rollout batch per replan: the refine of the last KSOS solution with the new candidates")
     p.add_argument("--record", action="store_true", help="save each replan's KSOS problem (sdp_seed<N>.npz; fixed)")
     p.add_argument("--goal", type=float, nargs=2, default=[2.0, -0.75])
+    p.add_argument("--goal-yaw", type=float, help="ksos: also turn the box to this yaw [deg] (mod 90)")
+    p.add_argument("--w-yaw", type=float, default=10.0, help="ksos with --goal-yaw: weight on the yaw error^2")
+    p.add_argument("--k-turn", type=float, default=0.15, help="ksos with --goal-yaw: push-point offset [m/rad]")
+    p.add_argument("--yaw-tol", type=float, default=10.0, help="with --goal-yaw: success also needs this [deg]")
     p.add_argument("--replan", type=float, default=0.2, help="replanning period [s]")
     p.add_argument("--hold", type=float, default=1.0, help="stand still before the first plan [s]")
     p.add_argument("--time", type=float, default=60.0)

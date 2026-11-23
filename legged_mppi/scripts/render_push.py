@@ -2,7 +2,7 @@
 
     .venv-ksos/bin/python legged_mppi/scripts/render_push.py logs/run_push/<run>/seed0.npz
 
-Writes seed0.mp4 next to the log. Pink: trunk reference, yellow: goal. Needs a log with `qpos`
+Writes seed0.mp4 next to the log. Pink: trunk reference, yellow: goal (and the goal pose, with a yaw goal). Needs a log with `qpos`
 (runs from before the full state was logged cannot be rendered).
 """
 import argparse
@@ -17,7 +17,7 @@ import numpy as np  # noqa: E402
 from run_push import DT, SCENE  # noqa: E402
 
 
-def render(path, fps=50, width=1280, height=720):
+def render(path, fps=50, width=1280, height=720, goal_yaw=None):
     import whole_body_mppi
     r = np.load(path)
     assert "qpos" in r, f"{path} has no qpos: rerun run_push.py to log the full state"
@@ -42,6 +42,12 @@ def render(path, fps=50, width=1280, height=720):
                 mujoco.mjv_initGeom(scn.geoms[scn.ngeom], mujoco.mjtGeom.mjGEOM_SPHERE, np.array([0.06, 0, 0]),
                                     np.asarray(pos, float), np.eye(3).ravel(), np.array(rgba, np.float32))
                 scn.ngeom += 1
+            if goal_yaw is not None:  # the goal pose: a flat square the size of the box
+                c, s = np.cos(goal_yaw), np.sin(goal_yaw)
+                mujoco.mjv_initGeom(scn.geoms[scn.ngeom], mujoco.mjtGeom.mjGEOM_BOX, np.array([0.19, 0.19, 0.003]),
+                                    np.r_[goal, 0.003], np.array([c, -s, 0, s, c, 0, 0, 0, 1.0]),
+                                    np.array([1, 1, 0, 0.5], np.float32))
+                scn.ngeom += 1
             writer.append_data(renderer.render())
     print(f"saved {out} ({len(Q) * DT:.1f} s at {1 / (every * DT):.0f} fps)")
 
@@ -50,5 +56,9 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("log", help="a seed*.npz from run_push.py")
     p.add_argument("--fps", type=int, default=50)
+    p.add_argument("--goal-yaw", type=float, help="draw the goal pose at this yaw [deg] (default: the logged one)")
     args = p.parse_args()
-    render(args.log, args.fps)
+    yaw = args.goal_yaw
+    if yaw is None and np.isfinite(np.load(args.log).get("goal_yaw", np.nan)):
+        yaw = float(np.load(args.log)["goal_yaw"])
+    render(args.log, args.fps, goal_yaw=None if yaw is None else np.radians(yaw))
